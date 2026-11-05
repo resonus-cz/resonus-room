@@ -1,0 +1,56 @@
+[project]
+name = "resonus-room"
+version = "0.1.0"
+authors = [{ name = "David Jun" }]
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = ["resonus-core @ git+https://github.com/resonus-cz/resonus-core@v0.8.1", "numpy", "scipy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy", "nbclient", "nbformat", "ipykernel"]
+
+[project.scripts]
+resonus-room = "resonus_room.cli:main"
+resonus-room-gui = "resonus_room.gui.main:main"
+
+[project.entry-points."resonus.apps"]
+resonus_room = "resonus_room.gui.plugin:Plugin"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["resonus_room*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "NPY", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+
+[tool.mypy]
+files = ["resonus_room", "tests"]
+python_version = "3.12"
+disallow_untyped_defs = true
+warn_unused_ignores = true
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = ["scipy", "scipy.*", "gi", "gi.*", "sounddevice", "h5py", "cycler", "nbclient", "nbformat"]
+ignore_missing_imports = true
