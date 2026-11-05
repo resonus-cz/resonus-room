@@ -2,6 +2,9 @@
 
 Semantic versioning: patch = fixes, minor = additions, major = breaking changes.
 
+## 0.1.1 (2026-11-05)
+- README: screenshot of the app. No change to the code.
+
 ## 0.1.0 (2026-11-05)
 First public release.
 

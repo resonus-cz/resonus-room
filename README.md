@@ -5,7 +5,9 @@ reverberation times and room acoustic parameters per **ISO 3382-1/-2**, and the 
 absorption coefficient of a test specimen per **ISO 354** (reverberation room method).
 Desktop app (GTK 4 / libadwaita), command line and Python/Jupyter, all on one core.
 
-> Status: pre-release (0.1.0). Calculation methods follow the cited standards and are
+![Re:sonus Room: transfer function (magnitude and phase) of a measurement](docs/app.png)
+
+> Status: pre-release (0.1.1). Calculation methods follow the cited standards and are
 > tested, but this is not a type-approved instrument; band-filter conformance to
 > IEC 61260-1 is not verified yet. See [Validation](#validation).
 
@@ -35,7 +37,7 @@ built from source by pip, so it needs the GObject introspection headers. On Fedo
 Then, in a virtual environment:
 
     python -m venv .venv
-    .venv/bin/pip install "resonus-room @ git+https://github.com/resonus-cz/resonus-room@v0.1.0"
+    .venv/bin/pip install "resonus-room @ git+https://github.com/resonus-cz/resonus-room@v0.1.1"
 
 Exact versions of all dependencies, as tested: `pip install -r requirements.lock`.
 
