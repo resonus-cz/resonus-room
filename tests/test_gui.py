@@ -46,6 +46,9 @@ def app():
 @pytest.fixture
 def hosted(app, tmp_path, monkeypatch):
     monkeypatch.setattr(plugin_module, "settings_path", lambda: tmp_path / "settings.toml")
+    monkeypatch.setattr(
+        plugin_module, "calibration_store_path", lambda: tmp_path / "calibrations.toml"
+    )
     plugin = plugin_module.Plugin()
     host = StandaloneHost(app, plugin, "test")
     plugin.settings = plugin.settings.replace(
@@ -167,6 +170,11 @@ def test_rt_tab_legend_toggles_and_table_overlay(hosted):
 
     plugin._table_toggle.set_active(True)
     assert plugin._table_frame.get_visible()
+    # nearly opaque pop-up panel sized to the whole table (user, 2026-11-06)
+    assert plugin._table_frame.has_css_class("resonus-overlay")
+    assert ".resonus-overlay" in plugin_module.APP_CSS
+    width = plugin._table.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+    assert plugin._table_frame.measure(Gtk.Orientation.HORIZONTAL, -1)[1] >= width
     plugin._table_toggle.set_active(False)
     assert not plugin._table_frame.get_visible()
 
@@ -335,13 +343,15 @@ def test_preferences_pages(hosted, fake_devices):
     plugin, _app = hosted
     host = plugin._host
     pages = plugin.preferences(host)
-    assert [p.get_title() for p in pages] == ["Measurement", "Device", "Analysis"]
+    assert [p.get_title() for p in pages] == ["Measurement", "Device", "Analysis", "Calibration"]
     assert group_titles(pages[0]) == ["Signal", "Processing", "Simulation"]
     assert group_titles(pages[1]) == ["Device", "Inputs", "Outputs"]
     assert group_titles(pages[2]) == ["Analysis", "Plots"]  # Plots: plot mark (D-24)
     all_groups = {f.metadata["group"] for f in fields(plugin_module.AppSettings)}
     shown = set(plugin_module.MEASUREMENT_GROUPS + plugin_module.ANALYSIS_GROUPS)
-    assert all_groups == shown | {"Device", "Channels"}
+    # STI: tuple field sti_speech_levels, not shown by settings_page; edited on the
+    # Calibration page (D-31)
+    assert all_groups == shown | {"Device", "Channels", "STI"}
 
 
 def test_preferences_pages_share_settings(hosted, fake_devices):
@@ -385,7 +395,7 @@ def test_device_list_failure_is_reported(hosted, monkeypatch):
 
     monkeypatch.setattr(plugin_module, "list_devices", broken)
     pages = plugin.preferences(plugin._host)
-    assert [p.get_title() for p in pages] == ["Measurement", "Device", "Analysis"]
+    assert [p.get_title() for p in pages] == ["Measurement", "Device", "Analysis", "Calibration"]
     assert toasts == ["audio devices not available: PortAudio library not found"]
 
 
@@ -531,7 +541,11 @@ def test_room_average_toggle(hosted, monkeypatch):
     plugin.show_session()
     toggle.set_active(True)
     ids = plugin.rt_view.trace_ids()
-    assert [i for i in ids if i.startswith("rt:avg:")] == ["rt:avg:EDT", "rt:avg:T20", "rt:avg:T30"]
+    assert [i for i in ids if i.startswith("rt:avg:")] == [
+        "rt:avg:EDT",
+        "rt:avg:T20",
+        "rt:avg:T30",
+    ]
     line = {ln.get_label(): ln for ln in plugin.rt_view.axes.get_lines()}["T20, Room average"]
     t20 = np.array([s.get(k).analysis.values("T20") for k in (0, 1)])
     np.testing.assert_allclose(line.get_ydata(), np.nanmean(t20, axis=0))
@@ -795,13 +809,14 @@ def test_stop_measurement(hosted, monkeypatch):
     monkeypatch.setattr(plugin_module, "open_device", lambda s: SlowIO(s.sample_rate))
     n = len(plugin.session.entries)
     app.activate_action("measure", None)
-    assert plugin._measure.get_label() == "Stop" and plugin._measure.get_sensitive()
+    assert plugin._measure_labels.get_visible_child_name() == "stop"
+    assert plugin._measure.get_sensitive()
     assert plugin._measure.has_css_class("destructive-action")
     assert not plugin._measure.has_css_class("suggested-action")
     assert not plugin._open.get_sensitive() and not plugin._test.get_sensitive()
     assert started.wait(10)
     app.activate_action("measure", None)  # Ctrl+M / the button again: stop
-    assert wait_for(lambda: plugin._measure.get_label() == "Measure", 10)
+    assert wait_for(lambda: plugin._measure_labels.get_visible_child_name() == "measure", 10)
     assert plugin._measure.get_sensitive() and plugin._measure.has_css_class("suggested-action")
     assert not plugin._measure.has_css_class("destructive-action")
     assert toasts[-1] == "Measurement stopped"
@@ -823,7 +838,8 @@ def test_measurement_device_error(hosted, monkeypatch):
     monkeypatch.setattr(plugin_module, "open_device", broken)
     app.activate_action("measure", None)
     assert toasts[-1] == "Measurement failed: no such device"
-    assert plugin._measure.get_label() == "Measure" and plugin._measure_io is None
+    assert plugin._measure_labels.get_visible_child_name() == "measure"
+    assert plugin._measure_io is None
 
 
 def test_header_brand_and_title(hosted):
@@ -875,3 +891,247 @@ def test_plot_mark_from_saved_settings(tmp_path, monkeypatch):
     plugin = plugin_module.Plugin()
     texts = [t.get_text() for t in plugin.rt_view.figure.texts if t.get_gid() == "resonus-brand"]
     assert texts == ["Studio X"]
+
+
+def ear_irs(seed_left=1, seed_right=2, n_right=None):
+    from resonus_core.data import ImpulseResponse, Metadata
+
+    from resonus_room.core.files import impulse_to_frequency_response
+
+    out = []
+    for seed in (seed_left, seed_right):
+        x = exponential_decay_ir(48000, 0.6, np.full(6, 0.3), band_set(1, 125, 4000), seed=seed)
+        ir = ImpulseResponse(x, 48000.0, "1", Metadata("t", "0"))
+        out.append((ir, impulse_to_frequency_response(ir)))
+    if n_right is not None:
+        ir = ImpulseResponse(out[1][0].data[:n_right], 48000.0, "1", Metadata("t", "0"))
+        out[1] = (ir, impulse_to_frequency_response(ir))
+    return out
+
+
+def test_clarity_tab(hosted):
+    # D-28, D-33: inner tabs Clarity / Definition / Centre time; table; shared average
+    from resonus_room.core.engine import settings_band_set
+    from resonus_room.plotting import EMPTY_CLARITY_LIMITS, EMPTY_TS_LIMITS, RATIO_LIMITS
+
+    plugin, app = hosted
+    page = plugin.stack.get_child_by_name("clarity")
+    assert page is not None
+    stack = plugin.clarity_stack
+    pages = stack.get_pages()
+    names = [pages.get_item(i).get_name() for i in range(pages.get_n_items())]
+    titles = [pages.get_item(i).get_title() for i in range(pages.get_n_items())]
+    assert names == ["clarity", "definition", "ts"]
+    assert titles == ["Clarity", "Definition", "Centre time"]
+    assert stack.get_visible_child_name() == "clarity"
+    figures = {
+        id(v.axes.figure) for v in (plugin.clarity_view, plugin.definition_view, plugin.ts_view)
+    }
+    assert len(figures) == 3  # one plot per inner tab
+    assert plugin.clarity_view.panels() == []
+    assert not hasattr(plugin, "_clarity_toggles")
+    assert tuple(plugin.clarity_view.axes.get_ylim()) == EMPTY_CLARITY_LIMITS
+    assert tuple(plugin.definition_view.axes.get_ylim()) == RATIO_LIMITS
+    assert tuple(plugin.ts_view.axes.get_ylim()) == EMPTY_TS_LIMITS
+    app.activate_action("measure", None)
+    assert wait_for(lambda: plugin.analysis is not None)
+    assert plugin.clarity_view.trace_ids() == ["cl:0:C50", "cl:0:C80"]
+    assert plugin.definition_view.trace_ids() == ["d:0:D50"]
+    assert plugin.ts_view.trace_ids() == ["ts:0:Ts"]
+    ts_line = plugin.ts_view.axes.get_lines()[0]
+    np.testing.assert_allclose(ts_line.get_ydata(), plugin.analysis.values("Ts") * 1000.0)
+    line = plugin.definition_view.axes.get_lines()[0]
+    np.testing.assert_allclose(line.get_ydata(), plugin.analysis.values("D50"))
+    assert all(ln.get_visible() for ln in plugin.clarity_view.axes.get_lines())
+    # export writes the plot of the visible inner tab
+    plugin.stack.set_visible_child_name("clarity")
+    stack.set_visible_child_name("ts")
+    assert plugin._clarity_visible_view() is plugin.ts_view
+    # table: one row per band
+    rows = plugin_module.clarity_rows(plugin.analysis)
+    assert len(rows) == len(settings_band_set(plugin.settings))
+    p = plugin.analysis.band_results[0]
+    assert rows[0][1:] == [f"{p.c50:.2f}", f"{p.c80:.2f}", f"{p.d50:.3f}", f"{p.ts * 1000:.0f}"]
+    plugin._clarity_table_toggle.set_active(True)
+    assert plugin._clarity_frame.get_visible()
+    assert plugin._clarity_frame.has_css_class("resonus-overlay")
+    assert plugin_module.CLARITY_COLUMNS[-1] == "Ts [ms]"
+    assert "Ts [s]" not in plugin_module.TABLE_COLUMNS
+    # one room average for both tabs; one band switch for both
+    plugin._clarity_average_toggle.set_active(True)
+    assert plugin._average_toggle.get_active()
+    plugin._average_toggle.set_active(False)
+    assert not plugin._clarity_average_toggle.get_active()
+    plugin._clarity_bands.set_selected(1)
+    assert plugin._bands.get_selected() == 1 and plugin.settings.bands == "third"
+    assert len(plugin.definition_view.axes.get_lines()[0].get_ydata()) == 18
+
+
+def test_iacc_tab_hidden_by_default_and_pairs(hosted):
+    from resonus_room.core.binaural import pair_iacc
+
+    plugin, _app = hosted
+    page = plugin.stack.get_page(plugin.stack.get_child_by_name("iacc"))
+    assert not page.get_visible()
+    plugin._on_settings(plugin.settings.replace(show_iacc=True))
+    assert page.get_visible()
+    assert plugin.iacc_view.axes.get_title() == plugin_module.NO_PAIR_TITLE
+    (left, fl), (right, fr) = ear_irs()
+    plugin.add_results("Measurement 1", [("s1m1L", left, fl), ("s1m1R", right, fr)], None)
+    ids = plugin.iacc_view.trace_ids()
+    assert ids == ["iacc:0:IACC early", "iacc:0:IACC late", "iacc:0:IACC full"]
+    want = pair_iacc(left, right, plugin.settings)
+    lines = {ln.get_label(): ln for ln in plugin.iacc_view.axes.get_lines()}
+    np.testing.assert_allclose(lines["IACC late, Measurement 1 s1m1"].get_ydata(), want.late)
+    np.testing.assert_allclose(
+        lines["IACC early, Measurement 1 s1m1"].get_xdata(), [125, 250, 500, 1000, 2000, 4000]
+    )
+    plugin._iacc_toggles["IACC full"].set_active(False)
+    assert not lines["IACC full, Measurement 1 s1m1"].get_visible()
+    # the right ear active: same pair, drawn once
+    plugin._on_active(plugin.session.entries[1].key)
+    assert plugin.iacc_view.trace_ids() == ids
+    # switched off: traces removed, tab hidden
+    plugin._on_settings(plugin.settings.replace(show_iacc=False))
+    assert not page.get_visible() and plugin.iacc_view.trace_ids() == []
+
+
+def test_iacc_pair_error_is_a_toast(hosted, monkeypatch):
+    plugin, _app = hosted
+    toasts = []
+    monkeypatch.setattr(plugin._host, "toast", toasts.append)
+    plugin._on_settings(plugin.settings.replace(show_iacc=True))
+    (left, fl), (right, fr) = ear_irs(n_right=20000)
+    plugin.add_results("Measurement 1", [("s1m1L", left, fl), ("s1m1R", right, fr)], None)
+    assert plugin.iacc_view.trace_ids() == []
+    assert len(toasts) == 1 and toasts[0].startswith("IACC of Measurement 1 s1m1: ")
+    plugin.show_session()  # same findings: no repeat
+    assert len(toasts) == 1
+
+
+def test_sti_tab_flow(hosted, tmp_path, monkeypatch):
+    # 043c (D-31): calibrated measurement -> source calibration -> noise -> STI
+    from datetime import UTC, datetime
+
+    from resonus_core.calibration import CalibrationRecord
+
+    from resonus_room.core.calibrate import input_profiles
+
+    plugin, app = hosted
+    toasts = []
+    monkeypatch.setattr(plugin._host, "toast", toasts.append)
+    assert plugin._sti_page is not None and not plugin._sti_page.get_visible()
+    for profile in input_profiles(plugin.settings, []):
+        plugin._store.append(CalibrationRecord.manual(profile, 120.0, datetime.now(UTC)))
+    plugin._on_settings(
+        plugin.settings.replace(
+            show_sti=True,
+            calibrated=True,
+            sti_vocal_effort="custom",
+            sti_speech_levels=(60.0, 61.0, 62.0, 63.0, 58.0, 52.0, 47.0),
+        )
+    )
+    assert plugin._sti_page.get_visible()
+    assert plugin.sti_tab.speech_levels == (60.0, 61.0, 62.0, 63.0, 58.0, 52.0, 47.0)
+    measure_and_wait(plugin, app, 1)
+    assert plugin.ir is not None and plugin.ir.unit == "Pa/FS"
+    assert plugin.save_source(tmp_path / "source.h5")
+    assert plugin.sti_tab.source_path == tmp_path / "source.h5"
+    plugin.record_noise_to(tmp_path / "noise", duration=10.0)  # IR 1 s + STI window 8 s
+    assert wait_for(lambda: plugin.sti_tab.noise is not None), toasts
+    assert sorted(q.name for q in (tmp_path / "noise").glob("noise_*.h5"))
+    assert wait_for(lambda: plugin.sti_tab.report is not None), toasts
+    assert 0.0 < plugin.sti_tab.report.sti < 1.0
+    assert plugin.sti_tab.result_label.get_text().startswith("STI ")
+    plugin.stack.set_visible_child_name("sti")
+    plugin.export_to(tmp_path / "sti.png")
+    assert (tmp_path / "sti.png").stat().st_size > 0, toasts
+
+
+def test_sti_needs_calibrated_measurement(hosted, tmp_path, monkeypatch):
+    plugin, app = hosted
+    toasts = []
+    monkeypatch.setattr(plugin._host, "toast", toasts.append)
+    measure_and_wait(plugin, app, 1)
+    assert plugin.ir.unit == "1"
+    from resonus_room.gui.sti_tab import NOT_CALIBRATED
+
+    assert plugin.sti_tab.message() == NOT_CALIBRATED
+    assert not plugin.save_source(tmp_path / "source.h5")
+    assert toasts and "Source calibration not saved" in toasts[-1]
+
+
+def test_measure_and_stop_same_width(hosted):
+    # user request 2026-11-06: the button does not change width when it becomes Stop
+    plugin, _app = hosted
+    idle = plugin._measure.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+    plugin._busy(True, measuring=True)
+    measuring = plugin._measure.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+    plugin._busy(False)
+    assert idle == measuring > 0
+
+
+def test_absorption_tab_wiring(hosted, tmp_path):
+    # 044c (D-32): page shown with show_absorption; evaluation in a thread; export
+    plugin, _app = hosted
+    toasts = []
+    plugin._host.toast = toasts.append
+    assert plugin._absorption_page is not None and not plugin._absorption_page.get_visible()
+    plugin._on_settings(plugin.settings.replace(show_absorption=True))
+    assert plugin._absorption_page.get_visible()
+    bands = band_set(3, 100, 5000)
+    for kind, t60 in (("empty", 2.0), ("specimen", 1.5)):
+        (tmp_path / kind).mkdir()
+        for k, name in enumerate(("s1m1", "s2m1")):
+            h = exponential_decay_ir(16000, 4.5, np.full(18, t60), bands, delay=0.01, seed=k)
+            wavfile.write(
+                tmp_path / kind / f"{name}.wav",
+                16000,
+                (0.5 * h / np.abs(h).max()).astype(np.float32),
+            )
+    tab = plugin.absorption_tab
+    tab.set_folder("empty", tmp_path / "empty")
+    tab.set_folder("specimen", tmp_path / "specimen")
+    tab.volume_row.set_text("200")
+    tab.area_row.set_text("10.8")
+    for key in ("empty", "specimen"):
+        tab.climate_rows[key]["temperature"].set_text("20")
+        tab.climate_rows[key]["relative_humidity"].set_text("50")
+    assert tab.evaluate()
+    assert wait_for(lambda: tab.run is not None), toasts
+    assert tab.save_button.get_sensitive()
+    plugin.stack.set_visible_child_name("absorption")
+    plugin.export_to(tmp_path / "abs.csv")
+    assert (tmp_path / "abs.csv").read_text().startswith("band_hz"), toasts
+    plugin.export_to(tmp_path / "setup.toml")
+    assert (tmp_path / "setup.toml").is_file()
+    plugin._on_settings(plugin.settings.replace(show_absorption=False))
+    assert not plugin._absorption_page.get_visible()
+
+
+def test_stop_does_not_block_the_main_loop(hosted, monkeypatch):
+    # user report 2026-11-06: Stop froze the GUI; abort() (sounddevice.stop()) can block
+    plugin, app = hosted
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingAbortIO(SimulatedIO):
+        def playrec(self, signal):
+            started.set()
+            self._aborted.wait(30)
+            return super().playrec(signal)
+
+        def abort(self):
+            super().abort()
+            release.wait(30)  # a backend stop that takes long
+
+    monkeypatch.setattr(plugin_module, "open_device", lambda s: BlockingAbortIO(s.sample_rate))
+    app.activate_action("measure", None)
+    assert started.wait(10)
+    t0 = time.monotonic()
+    plugin.stop_measurement()
+    assert time.monotonic() - t0 < 1.0  # returned although abort() is still blocked
+    assert not plugin._measure.get_sensitive()
+    release.set()
+    assert wait_for(lambda: plugin._measure_io is None, 10)
+    assert plugin._measure.get_sensitive()

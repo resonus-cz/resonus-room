@@ -16,13 +16,15 @@ from typing import Any
 
 from resonus_core import data  # noqa: F401
 from resonus_core.bands import band_set
+from resonus_core.calibration import CalibrationStore
 from resonus_core.data import BandResults, FrequencyResponse, ImpulseResponse, Metadata
 from resonus_core.measure import measurement_warnings
 from resonus_core.plot import MplPlotView  # noqa: F401
 
-from resonus_room import __version__
+from resonus_room import __version__, cli_sti
 from resonus_room.core.analysis import RoomAnalysis
 from resonus_room.core.binaural import IACC_BAND_RANGE, binaural_parameters
+from resonus_room.core.calibrate import store_path
 from resonus_room.core.compare import compare, comparisons_to_csv, summary
 from resonus_room.core.engine import analyze_ir, measure, open_device  # noqa: F401
 from resonus_room.core.files import (
@@ -47,6 +49,7 @@ from resonus_room.core.room_average import (
     average_to_csv,
 )
 from resonus_room.core.settings import BAND_CHOICES, AppSettings, load_settings
+from resonus_room.core.sti_inputs import source_calibration
 from resonus_room.plotting import (
     band_ticks,
     default_quantity,
@@ -86,6 +89,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     m.add_argument("--out", type=Path, required=True, help="output folder")
     m.add_argument("--json", action="store_true", help="print a machine-readable summary")
+    m.add_argument(
+        "--calibrated",
+        action="store_true",
+        help="save the impulse responses in Pa/FS with the inputs' calibration (D-31)",
+    )
+    m.add_argument(
+        "--source-calibration",
+        action="store_true",
+        help="with --calibrated: also save source_calibration.h5 (free field, 1 m; STI)",
+    )
+    m.add_argument("--store", type=Path, help="calibration history (default: the app's file)")
 
     tl = sub.add_parser(
         "test-levels",
@@ -177,6 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("rt60", type=Path)
     i.add_argument("--out", type=Path, required=True, help="output folder")
 
+    cli_sti.add_parsers(sub)
     return p
 
 
@@ -289,6 +304,7 @@ def _save_channel(
     fr: FrequencyResponse,
     analysis: RoomAnalysis,
     mark: str | None = None,
+    source: bool = False,
 ) -> None:
     """Write the files of one channel into ``out`` (created if missing).
 
@@ -296,10 +312,13 @@ def _save_channel(
     :func:`_write_analysis` with ``{"device": ir.metadata.device}``,
     ``transfer_function.png`` (:func:`_plot_fr`) and ``impulse_response.png``
     (:func:`_plot_ir` with the analysis), as for a single-channel measurement. ``mark``:
-    text of the plot mark (``AppSettings.plot_mark``; None: "Re:sonus").
+    text of the plot mark (``AppSettings.plot_mark``; None: "Re:sonus"). ``source``:
+    also ``source_calibration.h5`` (``source_calibration(ir)``, STI input, D-31).
     """
     out.mkdir(parents=True, exist_ok=True)
     data.save(out.joinpath("impulse_response.h5"), ir)
+    if source:
+        data.save(out.joinpath("source_calibration.h5"), source_calibration(ir))
     data.save(out.joinpath("frequency_response.h5"), fr)
     _write_analysis(analysis, out, {"device": ir.metadata.device}, mark)
     _plot_fr(fr, out.joinpath("transfer_function.png"), mark)
@@ -376,6 +395,13 @@ def main(argv: list[str] | None = None) -> int:
     """Run the CLI; returns the exit status."""
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "calibrate":
+            return cli_sti.calibrate_command(args)
+        if args.command == "record-noise":
+            return cli_sti.record_noise_command(args)
+        if args.command == "sti":
+            return cli_sti.sti_command(args)
+
         if args.command == "settings":
             AppSettings().save(args.path)
             return 0
@@ -498,16 +524,23 @@ def main(argv: list[str] | None = None) -> int:
             settings = _input_override(settings, args.inputs, args.input_labels)
             for warning in measurement_warnings(settings):
                 print(f"warning: {warning}", file=sys.stderr)
+            if args.source_calibration and not args.calibrated:
+                build_parser().error("--source-calibration needs --calibrated")
             r = measure(settings, open_device(settings))
+            irs = r.impulse_responses
+            if args.calibrated:
+                store = CalibrationStore.open(args.store or store_path())
+                irs = cli_sti.calibrate_irs(settings, irs, store, cli_sti.devices_for(settings))
+            src = bool(args.source_calibration)
             out = args.out
             out.mkdir(parents=True, exist_ok=True)
             settings.save(out.joinpath("settings.toml"))
-            pairs = list(zip(r.impulse_responses, r.frequency_responses, strict=True))
+            pairs = list(zip(irs, r.frequency_responses, strict=True))
             device = pairs[0][0].metadata.device
             if len(pairs) == 1:  # one channel: files directly in the output folder
                 ir, fr = pairs[0]
                 analysis = analyze_ir(ir, settings)
-                _save_channel(out, ir, fr, analysis, settings.plot_mark)
+                _save_channel(out, ir, fr, analysis, settings.plot_mark, src)
                 if args.json:
                     print(json.dumps({"out": str(out), "device": device} | _summary(analysis)))
                 return 0
@@ -516,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
             for ir, fr in pairs:
                 label = ir.metadata.extra["channel"]["label"]
                 analysis = analyze_ir(ir, settings)
-                _save_channel(out / label, ir, fr, analysis, settings.plot_mark)
+                _save_channel(out / label, ir, fr, analysis, settings.plot_mark, src)
                 summaries[label] = _summary(analysis)
             if args.json:
                 print(json.dumps({"out": str(out), "device": device, "channels": summaries}))

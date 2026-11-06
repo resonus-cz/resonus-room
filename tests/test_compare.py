@@ -127,10 +127,10 @@ def test_real_rew_agreement(tmp_path):
     from resonus_room.core.rew import read_rew_rt60
 
     diffs = {"T20": [], "T30": []}
-    for wav in sorted(REAL.glob("*.wav")):
+    for wav in sorted(REAL.glob("box*/*.wav")):  # wavs split per box (user, 2026-11-06)
         ir = load_impulse_response(wav)
         a = analyze(ir.data, ir.sample_rate, bs(3, 400, 4000))
-        ref = read_rew_rt60(wav.with_name(f"RT60_{wav.stem}.txt")).third
+        ref = read_rew_rt60(REAL / f"RT60_{wav.stem}.txt").third
         for c in compare(analysis_to_band_results(a, META), ref, ("T20", "T30")):
             diffs[c.quantity].append(c.difference)
     for q, d in diffs.items():

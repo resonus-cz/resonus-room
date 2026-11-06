@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 from resonus_core.data import ImpulseResponse, Metadata
-from resonus_core.style import TRACE_COLORS
+from resonus_core.style import TOKENS, TRACE_COLORS
 
 from resonus_room.core.session import (
     AVERAGE_COLOR,
@@ -22,7 +22,8 @@ def chans(*labels):
 
 
 def test_colors():
-    assert ENTRY_COLORS == TRACE_COLORS[:7] and AVERAGE_COLOR == TRACE_COLORS[7]
+    assert ENTRY_COLORS == TRACE_COLORS and len(ENTRY_COLORS) == 7
+    assert AVERAGE_COLOR == TOKENS["neutral_color"] == "#3d3846"
     assert AVERAGE_COLOR not in ENTRY_COLORS
 
 

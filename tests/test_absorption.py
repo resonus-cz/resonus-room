@@ -18,6 +18,7 @@ from resonus_room.core.absorption import (
     max_empty_room_area,
     octave_values,
     round_to,
+    speed_of_sound_reported,
     volume_factor,
 )
 
@@ -167,12 +168,29 @@ def test_absorption_issues_and_errors():
     t1 = 55.3 * 200 / (343.0 * (6.0 + 4 * 200 * m1))
     r = absorption(t1, 0.8 * t1, 200.0, c, Climate(16.0, 20.0), specimen_area=11.0)
     np.testing.assert_allclose(r.a1, 6.0, rtol=1e-12)
-    assert r.issues == ("6.3.2: relative humidity 20 % outside 30...90 %",)
+    assert r.issues == ("with specimen: 6.3.2: relative humidity 20 % outside 30...90 %",)
+    # user, 2026-11-06 (D-35): temperatures outside 15...30 degC are findings, not errors;
+    # c = 331 + 0.6 t extrapolated (ISO 354:2003 8.1.2.1 Eq. (6))
+    r = absorption(t1, 0.8 * t1, 200.0, Climate(12.0, 50.0), Climate(32.0, 95.0), 11.0)
+    assert r.issues == (
+        "empty room: 6.3.2: temperature 12 degC < 15 degC",
+        "empty room: 8.1.2.1: temperature 12 degC outside 15...30 degC of Eq. (6); "
+        "c = 338.2 m/s extrapolated",
+        "with specimen: 6.3.2: relative humidity 95 % outside 30...90 %",
+        "with specimen: 8.1.2.1: temperature 32 degC outside 15...30 degC of Eq. (6); "
+        "c = 350.2 m/s extrapolated",
+    )
+    assert np.all(np.isfinite(r.alpha))
+    assert speed_of_sound_reported(12.0)[0] == pytest.approx(331.0 + 0.6 * 12.0)
+    assert speed_of_sound_reported(20.0) == (float(speed_of_sound(20.0)), [])
+    with pytest.raises(ValueError, match="no positive speed of sound"):
+        speed_of_sound_reported(-600.0)
     with pytest.raises(ValueError):
         absorption(np.ones(17), np.ones(18), 200.0, c, c)
     with pytest.raises(ValueError):
         absorption(np.ones(18), np.ones(18), 200.0, c, c, specimen_area=0.0)
     with pytest.raises(ValueError):
         absorption(np.ones(18), np.ones(18), 200.0, c, c, n_objects=0)
-    with pytest.raises(ValueError):
-        absorption(np.ones(18), np.ones(18), 200.0, Climate(10.0, 50.0), c)  # c outside 15-30 degC
+    # c outside 15-30 degC: a finding, not an error since 2026-11-06 (D-35)
+    r = absorption(np.ones(18), np.ones(18), 200.0, Climate(10.0, 50.0), c)
+    assert any(i.startswith("empty room: 8.1.2.1") for i in r.issues)

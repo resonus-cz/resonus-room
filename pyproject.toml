@@ -1,11 +1,11 @@
 [project]
 name = "resonus-room"
-version = "0.1.1"
+version = "0.2.1"
 authors = [{ name = "David Jun" }]
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-dependencies = ["resonus-core @ git+https://github.com/resonus-cz/resonus-core@v0.8.1", "numpy", "scipy"]
+dependencies = ["resonus-core @ git+https://github.com/resonus-cz/resonus-core@v0.11.1", "numpy", "scipy"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "mypy", "nbclient", "nbformat", "ipykernel"]

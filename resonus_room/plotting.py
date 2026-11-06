@@ -19,6 +19,7 @@ from resonus_core.plot import MARKER_SIZE, MplPlotView, PlotView
 
 from resonus_room.core.absorption import AbsorptionResult
 from resonus_room.core.analysis import RoomAnalysis
+from resonus_room.core.binaural import BinauralParameters, iacc_band_set
 from resonus_room.core.decay import DecayCurve
 from resonus_room.core.energy import EARLY_50, EARLY_80
 from resonus_room.core.fit import DecayFit
@@ -37,6 +38,23 @@ EMPTY_MAGNITUDE_LIMITS: Final = (-60.0, 20.0)  # dB re 1, uncalibrated transfer 
 EMPTY_TIME_LIMITS: Final = (0.0, 1.0)  # s
 EMPTY_LEVEL_LIMITS: Final = (-100.0, 0.0)  # dB re the peak
 EMPTY_RT_LIMITS: Final = (0.0, 3.0)  # s, ordinary rooms to large halls
+EMPTY_CLARITY_LIMITS: Final = (-10.0, 10.0)  # dB, C50/C80 of ordinary rooms
+# D50 and IACC are ratios in [0, 1] (ISO 3382-1:2009 Eq. (A.11); Eq. (B.2), |IACF| <= 1).
+RATIO_LIMITS: Final = (0.0, 1.0)
+
+# Ts in ms, as in ISO 3382-1:2009 Table A.1 (typical range 60...260 ms); design choice
+# (D-29): empty Ts plot 0...300 ms.
+EMPTY_TS_LIMITS: Final = (0.0, 300.0)
+
+# Parameters of the band tabs (user requests 2026-11-05, D-28, D-29): RT tab; Clarity tab
+# with C50/C80 (dB) wide on top, D50 (ratio) and Ts (ms) side by side below; IACC tab.
+RT_PARAMETERS: Final = ("EDT", "T20", "T30")
+CLARITY_PARAMETERS: Final = ("C50", "C80")
+DEFINITION_PARAMETERS: Final = ("D50",)
+CENTRE_TIME_PARAMETERS: Final = ("Ts",)
+# Factor from the analysis unit to the plotted unit: Ts from s to ms (D-29).
+PARAMETER_SCALES: Final = {"Ts": 1000.0}
+IACC_PARAMETERS: Final = ("IACC early", "IACC late", "IACC full")
 
 
 def setup_response_axes(view: PlotView) -> None:
@@ -250,10 +268,12 @@ def setup_rt_axes(view: PlotView) -> None:
 def show_rt(view: PlotView, analysis: RoomAnalysis, name: str, trace_id: str, label: str) -> None:
     """Add or replace the per-band values of one parameter.
 
-    Add or replace the per-band values of ``name`` (``"EDT"``, ``"T20"``, ``"T30"``)
-    against the nominal band frequencies; missing values are NaN gaps.
+    Add or replace the per-band values of ``name`` (any name of ``RoomAnalysis.values``)
+    against the nominal band frequencies, times ``PARAMETER_SCALES.get(name, 1.0)`` (Ts in
+    ms); missing values are NaN gaps.
     """
-    view.set_trace(trace_id, analysis.bands.nominal, analysis.values(name), label=label)
+    scale = PARAMETER_SCALES.get(name, 1.0)
+    view.set_trace(trace_id, analysis.bands.nominal, analysis.values(name) * scale, label=label)
 
 
 def setup_absorption_axes(view: PlotView) -> None:
@@ -321,7 +341,11 @@ def show_band_results(
 
 # Design choice (user decision 2026-11-04, D-19): in the RT tab the colour identifies the
 # entry and the line style the parameter.
-PARAMETER_LINESTYLES: Final = {"EDT": ":", "T20": "--", "T30": "-"}
+PARAMETER_LINESTYLES: Final = {
+    "EDT": ":", "T20": "--", "T30": "-", "Ts": "-",
+    "C50": "--", "C80": "-", "D50": "-",
+    "IACC early": "-", "IACC late": "--", "IACC full": ":",
+}  # fmt: skip
 # Design choices (D-19): legend title and a wider line for the room average.
 AVERAGE_TITLE = "Room average"
 AVERAGE_LINE_WIDTH = 2.5
@@ -447,7 +471,7 @@ def show_average(
     view.set_trace(
         trace_id,
         average.bands.nominal,
-        average.mean[name],
+        average.mean[name] * PARAMETER_SCALES.get(name, 1.0),
         label=rt_label(name, AVERAGE_TITLE),
     )
     line = trace_line(view, rt_label(name, AVERAGE_TITLE))
@@ -581,13 +605,115 @@ def empty_limits(view: MplPlotView, xlim: tuple[float, float], ylim: tuple[float
     view.refresh()
 
 
-def empty_rt_axes(view: MplPlotView, bands: BandSet) -> None:
-    """Empty reverberation-time plot: the band range of the settings and their ticks.
+def empty_band_axes(view: MplPlotView, bands: BandSet, ylim: tuple[float, float]) -> None:
+    """Empty band plot: the band range and ticks of ``bands``, y limits ``ylim``.
 
     ``band_ticks(view, bands.nominal, bands.fraction)``, then ``empty_limits(view,
-    (bands.lower[0], bands.upper[-1]), EMPTY_RT_LIMITS)``. Nothing for an empty band set.
+    (bands.lower[0], bands.upper[-1]), ylim)``. Nothing for an empty band set.
     """
     if len(bands) == 0:
         return
     band_ticks(view, bands.nominal, bands.fraction)
-    empty_limits(view, (float(bands.lower[0]), float(bands.upper[-1])), EMPTY_RT_LIMITS)
+    empty_limits(view, (float(bands.lower[0]), float(bands.upper[-1])), ylim)
+
+
+def empty_rt_axes(view: MplPlotView, bands: BandSet) -> None:
+    """Empty reverberation-time plot: ``empty_band_axes(view, bands, EMPTY_RT_LIMITS)``."""
+    empty_band_axes(view, bands, EMPTY_RT_LIMITS)
+
+
+def setup_clarity_axes(view: PlotView) -> None:
+    """Configure the inner tab Clarity of the Clarity tab (C50, C80; D-33).
+
+    ``view.set_axes(xlabel="Frequency [Hz]", ylabel="Clarity [dB]", xscale="log",
+    title="Clarity")``.
+    """
+    view.set_axes(
+        xlabel="Frequency [Hz]",
+        ylabel="Clarity [dB]",
+        xscale="log",
+        title="Clarity",
+    )
+
+
+def setup_definition_axes(view: PlotView) -> None:
+    """Configure the inner tab Definition of the Clarity tab (D50; D-33).
+
+    ``view.set_axes(xlabel="Frequency [Hz]", ylabel="D50 [–]", xscale="log",
+    title="Definition")``.
+    D50 is a ratio (ISO 3382-1:2009 Eq. (A.11)), not a percentage.
+    """
+    view.set_axes(
+        xlabel="Frequency [Hz]",
+        ylabel="D50 [–]",
+        xscale="log",
+        title="Definition",
+    )
+
+
+def setup_centre_time_axes(view: PlotView) -> None:
+    """Configure the inner tab Centre time of the Clarity tab (Ts; D-29, D-33).
+
+    ``view.set_axes(xlabel="Frequency [Hz]", ylabel="Ts [ms]", xscale="log",
+    title="Centre time")``.
+    Centre time, ISO 3382-1:2009 A.2.3 Eq. (A.13), shown in ms as in Table A.1.
+    """
+    view.set_axes(xlabel="Frequency [Hz]", ylabel="Ts [ms]", xscale="log", title="Centre time")
+
+
+def setup_iacc_axes(view: PlotView) -> None:
+    """Configure the IACC tab.
+
+    ``view.set_axes(xlabel="Frequency [Hz]", ylabel="IACC [–]", xscale="log",
+    title="Interaural cross-correlation")``.
+    """
+    view.set_axes(
+        xlabel="Frequency [Hz]",
+        ylabel="IACC [–]",
+        xscale="log",
+        title="Interaural cross-correlation",
+    )
+
+
+def empty_iacc_axes(view: MplPlotView) -> None:
+    """Empty IACC plot: ``empty_band_axes(view, iacc_band_set(), RATIO_LIMITS)``.
+
+    ``iacc_band_set`` from :mod:`resonus_room.core.binaural`.
+    """
+    empty_band_axes(view, iacc_band_set(), RATIO_LIMITS)
+
+
+def show_iacc_entry(
+    view: MplPlotView,
+    params: BinauralParameters,
+    bands: BandSet,
+    name: str,
+    trace_id: str,
+    title: str,
+    color: str,
+) -> None:
+    """Add or replace one IACC interval of one ear pair in the IACC tab.
+
+    ``values = {"IACC early": params.early, "IACC late": params.late, "IACC full":
+    params.full}[name]``; ``view.set_trace(trace_id, bands.nominal, values,
+    label=rt_label(name, title))``; then on ``trace_line(view, rt_label(name, title))``:
+    ``set_color(color)``, ``set_linestyle(PARAMETER_LINESTYLES[name])``,
+    ``set_marker("o")``, ``set_markersize(MARKER_SIZE)``.
+
+    Raises
+    ------
+    KeyError
+        For a name not in ``IACC_PARAMETERS``.
+    ValueError
+        ``f"{len(values)} values for {len(bands)} bands"`` if the lengths differ.
+    """
+    values = {"IACC early": params.early, "IACC late": params.late, "IACC full": params.full}[name]
+    if len(values) != len(bands):
+        raise ValueError(f"{len(values)} values for {len(bands)} bands")
+    label = rt_label(name, title)
+    view.set_trace(trace_id, bands.nominal, values, label=label)
+    line = trace_line(view, label)
+    line.set_color(color)
+    line.set_linestyle(PARAMETER_LINESTYLES[name])
+    line.set_marker("o")
+    line.set_markersize(MARKER_SIZE)

@@ -248,7 +248,9 @@ confirmation; each has a matching item in `docs/QUESTIONS.md`.
 - Meter: scale -100...0 dB re full scale, marks -12, -42, -60, -100 dB (user); zones
   (design choice): hot >= -12, good -42...-12, low -60...-42, quiet below; bar = peak of
   the latest block, line = highest peak, tick = RMS, red box = clipped since the test
-  started (|x| >= 1 - 2**-15, the top code of a 16-bit converter; design choice).
+  started (|x| >= 1 - 2**-15, the top code of a 16-bit converter; design choice; the
+  one clipping value of the whole stack, user 2026-11-05: resonus-core calibration and
+  resonus-meter use it too).
 - The simulated room is normalised to unit energy, sum h**2 = 1 (user decision Q-G5,
   2026-11-05; before: energy gain about +34 dB, so simulated tests clipped above about
   -34 dB). T and all other level-independent results are unchanged; absolute simulated
@@ -333,3 +335,175 @@ confirmation; each has a matching item in `docs/QUESTIONS.md`.
   `export_public.sh --co-author` and the changelog, and closed with a link. Never merged
   on GitHub (the push mirror would overwrite it).
 - The export refuses workflow traces and the copyright-holder placeholder of the README.
+
+## D-28: Energy parameters and IACC in the GUI (user, 2026-11-05)
+Replaces the earlier "binaural parameters not in the GUI" (Q-M6).
+- **Ts** (superseded by D-29: Clarity tab) in the reverberation-time tab, a check button next to EDT/T20/T30 (a time in s on
+  the same axis; ylabel "Time [s]"), dash-dot line; a Ts column in the band table.
+- **Clarity tab**: C50 and C80 (dB) above D50 (ratio, ISO 3382-1:2009 Eq. (A.11), not a
+  percentage) in one figure with a shared frequency axis; check buttons C50 / C80 / D50
+  as in the RT tab; overlaid entries, room average (ISO 3382-2:2008 clause 8) and band
+  table as in the RT tab.
+- **IACC tab**, shown only with the setting `show_iacc` (group Plots, off by default):
+  early / late / full IACC (ISO 3382-1:2009 B.4) of each ear pair, check buttons per
+  interval; always octave bands 125 Hz-4 kHz (B.4), whatever the band switch.
+- **Ear pairs by label** (D-17 convention): `s#m#L` with `s#m#R` of the same
+  measurement, or of two opened files whose names differ only in that label
+  (`s1m1L.wav` / `s1m1R.wav`, after labelling them). No pair, no IACC.
+- Line styles (design choice): C50 dashed, C80 and D50 solid; IACC early solid, late
+  dashed, full dotted.
+
+## D-29: Clarity tab layout; Ts with the clarity measures (user, 2026-11-05)
+Replaces the Ts placement of D-28.
+- Ts is the centre time (ISO 3382-1:2009 A.2.3, Eq. (A.13)), grouped in Table A.1 with C80
+  and D50 under "perceived clarity of sound"; it moves from the reverberation-time tab to
+  the Clarity tab.
+- Layout: C50/C80 (dB) as the larger plot on top; D50 (ratio) and Ts (ms, as in Table A.1)
+  side by side below; one figure with one toolbar (resonus-core 0.9.0
+  `MplPlotView.add_row`). Check buttons C50 / C80 / D50 / Ts; the Clarity table gains a
+  "Ts [ms]" column, the RT table loses its Ts column.
+- Ts is computed and stored in s (CSV, JSON, HDF5, room-average CSV unchanged); only the
+  plot and the GUI table show ms. Empty Ts plot 0-300 ms (design choice, around the
+  typical range 60-260 ms of Table A.1).
+
+## D-30: resonus-core 0.10.0 (user, 2026-11-05; Q-C7)
+- Core main is released as v0.10.0 (calibration D-C1, style tokens with the dark variant
+  D-T1, meter-bundle reader D-S1, `LevelHistory`); room pins the tag.
+- Colours (core D-T1): the entries use all seven trace colours (trace 4 is now Orange 4);
+  the room average uses the neutral token `TOKENS["neutral_color"]` (Dark 3, unchanged
+  value), which is no longer a trace colour.
+- `sti.P0` is `resonus_core.calibration.P0` (ISO 1683:2015 Table 1); STI items 2-4
+  (noise capture, source calibration, calibrated in-situ IR) can now use core
+  calibration.
+
+## D-31: Calibration and STI inputs in the app (2026-11-05; confirmed by the user 2026-11-06, Q-STI10)
+Working unsupervised ("do everything you can without my input"); each point is a design
+choice, listed in QUESTIONS.md Q-STI10.
+- **Calibration history:** the app's own file `$XDG_DATA_HOME/resonus-room/calibrations.toml`
+  (resonus-core format and method, D-C1). Not shared with resonus-meter: the meter
+  identifies devices by cpal names, room by PortAudio keys `"host API: name"`, so records
+  would not match anyway.
+- **Profiles:** one per measurement input (not the reference); the input device must be
+  chosen explicitly (the default device can change); the simulated device has the id
+  `simulated`.
+- **Units:** a measured IR has unit `"1"` (input FS per output FS, or per reference FS);
+  calibrated with the input's offset it is `"Pa/FS"`. Source calibration and in-situ IR
+  are comparable only with the same drive chain (output, amplifier gain, reference).
+- **Files of the STI inputs:** resonus-core has no time-signal kind, so the noise recording
+  (unit `"Pa"`) and the source calibration (unit `"Pa/FS"`) are `ImpulseResponse` files
+  with `metadata.extra["role"]` = `background-noise` / `source-calibration`. A core kind
+  for plain signals would be cleaner: candidate for the user's core curation (Q-C9).
+- **STI analysis lengths:** the whole in-situ IR as build-up, then 8 s of analysis (at
+  least five periods of 0.63 Hz); noise recordings default to 20 s.
+- **Speech levels:** a required user input until Q-STI3 (no default from the filed
+  sources).
+
+## D-32: ISO 354 absorption from two folders, GUI tab (2026-11-06; confirmed by the user the same day, Q-A1)
+User request 2026-11-06: "load irs from two selected folders, with and without sample,
+fill in the other inputs and evaluate. Should go in another tab, toggled in the settings."
+Provisional choices (QUESTIONS.md Q-A1):
+- **Folder contents** (`core/iso354_folders.py`): every impulse response in the folder is
+  one position: top-level `.wav` (first channel; REW exports) and resonus `.h5` files that
+  hold an `ImpulseResponse` without a `role` (so `measure --out` folders work), plus
+  `<label>/impulse_response.h5` channel subfolders. Hidden files are skipped.
+- **Positions:** labels `s#m#` from file or subfolder names; two files with the same label
+  in one folder are refused (the REW set test1 holds two boxes, " s1m 1" and "s1m 1",
+  in one folder: averaging them would mix rooms). With labels for every file the counts
+  of ISO 354:2003 7.1.4 are checked, per condition when the two folders differ. The
+  usual case is the same labels in both folders (same positions with and without the
+  specimen; user 2026-11-06): one check for both. Fully labelled folders with different
+  position sets get a note naming the labels found in only one of them (design choice,
+  not a clause; the means T1 and T2 are still taken over each folder, 8.1.1).
+- **Reproducibility:** the evaluated setup can be saved as the setup TOML of
+  `resonus-room absorption`, so a GUI result can be recomputed from the command line.
+- **GUI** (tab "Absorption", setting `show_absorption`, off by default): the inputs of one
+  evaluation live in the tab, not in Preferences: volume, specimen area or number of
+  objects, optional largest room dimension (6.1.2 check), temperature and relative
+  humidity per condition without defaults (they must be measured), pressure default
+  101.325 kPa (as `load_setup`). The analysis settings (filter direction, onset, ...)
+  are those of Preferences; bands are fixed to one-third octaves 100 Hz-5 kHz
+  (ISO 354:2003 clause 5, `position_t20`).
+
+## D-33: Clarity tab with inner tabs; Measure/Stop one width (user, 2026-11-06)
+User: "In the clarity and definition tab, the plots are a bit too wide. There is also too
+much on a single frame. Instead of the visibility selection make a second level of tabs
+inside the frame, the room average and other selectors can stay next to it."
+- The Clarity tab has inner tabs (`Adw.InlineViewSwitcher`) **Clarity** (C50, C80),
+  **Definition** (D50) and **Centre time** (Ts), each one plot with its own toolbar and
+  title, replacing the C50/C80/D50/Ts check buttons and the shared figure of D-29. Room
+  average, band switch and Table stay on the right of the bar. Export of a plot format
+  writes the visible inner tab. C50 and C80 share one plot (same quantity and unit,
+  ISO 3382-1:2009 Table A.1); separate inner tabs for them are a one-line change.
+- Measure and Stop: both labels in one homogeneous `Gtk.Stack` inside the button, so the
+  button keeps the width of the longer label (user, same day).
+
+## D-34: STI speech levels per vocal effort (user, 2026-11-06; Q-STI3)
+User: "the Odeon application note lists spectra for different vocal effort. I would use
+those". Source: J. H. Rindel, ODEON Application Note "Calculation of Speech Transmission
+Index in rooms", February 2014, Table 1 (ANSI S3.5 speech SPL at 1 m, 250 Hz-8 kHz).
+- 125 Hz: 250 Hz level - 6 dB, the rule of the note's text p. 3 (user choice; the note's
+  sound power rows would give about 4 dB less).
+- Shouted (82.3 dB(A)) lowered by 0.4 (82.3 - 75) = 2.92 dB in every band: ISO 9921:2003
+  Annex A as quoted by the note p. 4 (user choice; ISO 9921 itself not in the library).
+- Setting `sti_vocal_effort` (custom, normal, raised, loud, shouted); default "normal"
+  (design choice: the note's first row, BB93 student-to-student); "custom" uses
+  `sti_speech_levels`. Transcription checked: the A-weighted sums of the rows with IEC
+  61672-1:2013 Table 3 reproduce the table's A-weighted column within 0.05 dB.
+- Q-STI5 (per position plus room mean) and Q-STI6 (male weighting first) answered yes by
+  the user the same day; Q-STI4 (masking, reception threshold) needs IEC 60268-16:2020
+  Annex A or Steeneken & Houtgast 1999 (Q-STI1, Q-STI9).
+
+## D-35: ISO 354 compliance findings never block the evaluation (user, 2026-11-06)
+
+"I would like to calculate the absorption no matter what standard compliancy is met - the
+issues should be displayed and recorded, but should not block the analysis."
+- `run_absorption` already collects the 6.1.4, 6.2.1.1, 7.1.4 and other checks into
+  `AbsorptionResult.issues` without raising; only unusable input (no folder, no IR, a
+  repeated label, a non-number in the form) stops an evaluation.
+- GUI: the plot and table are always drawn; the findings are in a pop-up panel (D-36)
+  behind a "Findings (N)" toggle, so they never take the plot's height (the cause of the
+  report: 15 wrapped lines below the plot squeezed it on the user's 1 m3 box data).
+- Temperature outside 15...30 degC (user, 2026-11-06: "I get errors about the
+  temperature range. That and RH should also go to findings"): resonus-core
+  `speed_of_sound` raises there (ISO 354:2003 8.1.2.1 NOTE gives Eq. (6) for that range);
+  the app extrapolates c = 331 + 0.6 t and adds the finding "8.1.2.1: ... extrapolated"
+  (`speed_of_sound_reported`). RH outside 30...90 % was already a 6.3.2 finding. Climate
+  findings now start with "empty room: " or "with specimen: ". ISO 9613-1:1993 clause 7
+  gives accuracy estimates, not limits; the core air attenuation only refuses RH outside
+  0...100 % and p <= 0 (physically invalid, still errors).
+- Recorded: JSON (`issues`, `notes_folders`), HDF5 extra metadata (`issues`, `notes`,
+  `notes_folders`), CLI warnings on stderr. The CSV stays the plain band table.
+
+## D-36: Pop-up panels for tables and findings (user, 2026-11-06)
+
+"change findings to a pop-up similar to the Table and toggled next to it ... Finetune the
+Table size ... for all such tables through the app, make the background less
+transparent (also apply to the template if applicable)."
+- `gui/overlays.py`: `overlay_panel` (hidden frame at the top right of the plot's
+  `Gtk.Overlay`, CSS class `resonus-overlay`: 95 % view background, accent border,
+  shadow), `band_table`, `findings_panel`, `fill_table`, `exclusive` (one panel at a
+  time). The scroller takes the content's natural width (the overlay limits it to the plot) and height up to 480 px (layout
+  choice), so a table shows all its columns; before, the absorption table had no width
+  and showed about one column.
+- Used by the RT, Clarity and Absorption tables and the Absorption findings ("Findings
+  (N)" next to "Table"); the plot fills the right part of the Absorption tab.
+- Also in the app template (skeleton `gui/overlays.py`, CSS in `layout.py`). A second
+  app-local copy: part of the resonus-core layout proposal Q-C6.
+- Table content to be revised by the user: Q-T2.
+
+## D-37: resonus-core 0.11.0 (user, 2026-11-06: Q-C6 "move them", Q-C9 "add it", Q-C10 "fix it")
+
+- Stop (Q-C10): `SounddeviceIO.playrec`/`rec` run on their own streams
+  whose callback ends at the next block after `abort()`; `abort()` no longer calls
+  `sounddevice.stop()` from another thread; a stream that does not finish within the
+  signal length + 10 s raises instead of hanging. Room still calls `abort()` off the main
+  loop (044c).
+- `TimeSignal` (Q-C9): noise recordings (`record_noise`, Record noise…,
+  `resonus-room record-noise`) are written as `TimeSignal` with the role key and
+  `start_utc`; `noise_band_levels`, `sti_at_position`, the STI tab and `resonus-room sti`
+  also read the older `ImpulseResponse` noise files (`NoiseRecording`).
+- Layout (Q-C6): `resonus_core.gui.layout` (CSS, brand, ribbon, tab panel)
+  and `resonus_core.gui.overlays` (pop-up panels, D-36) replace room's own copies
+  (`plugin.py` helpers, `gui/overlays.py`); the ribbon now uses `ribbon(groups)`, so its
+  groups share one vertical size group (captions on one line, as in the template).
+- The app template is versioned; this app records its compliance in a private file.

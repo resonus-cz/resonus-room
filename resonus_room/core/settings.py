@@ -20,6 +20,7 @@ from resonus_core.style import TOKENS
 
 from resonus_room.core.decay import METHODS
 from resonus_room.core.positions import METHODS as POSITION_METHODS
+from resonus_room.core.sti import VOCAL_EFFORTS
 
 BAND_CHOICES = ("octave", "third")
 # Channel labels, naming convention s#m# (user decisions D-17): outputs
@@ -112,6 +113,57 @@ class AppSettings(MeasurementSettings):
         group="Plots",
         help="Text in the bottom-right corner of every plot and exported image; empty: none",
     )
+    # IACC tab (user request 2026-11-05, D-28): off by default, binaural measurements only.
+    show_iacc: bool = param(
+        False,
+        label="IACC tab",
+        group="Plots",
+        help="Show the IACC tab (ISO 3382-1:2009 Annex B) for ear pairs labelled s#m#L / s#m#R",
+    )
+    # STI tab (docs/PLAN_STI.md item 7): off by default, needs calibrated inputs (D-31).
+    show_sti: bool = param(
+        False,
+        label="STI tab",
+        group="Plots",
+        help="Show the STI tab (PROVISIONAL: original STI, not IEC 60268-16:2020)",
+    )
+    # Absorption tab (user request 2026-11-06, D-32): ISO 354 from two folders; off by
+    # default, reverberation-room measurements only.
+    show_absorption: bool = param(
+        False,
+        label="Absorption tab",
+        group="Plots",
+        help="Show the Absorption tab (ISO 354:2003 from two folders: empty room, with specimen)",
+    )
+    # Vocal effort of the talker for STI (Q-STI3, user decision 2026-11-06): the speech
+    # spectra of the Odeon application note (core/sti.py [4]); "custom" uses
+    # sti_speech_levels. Default "normal": design choice D-34.
+    sti_vocal_effort: str = param(
+        "normal",
+        label="STI vocal effort",
+        choices=VOCAL_EFFORTS,
+        group="STI",
+        help="Speech level at 1 m: ANSI S3.5 spectra (Odeon application note) or custom",
+    )
+    # Speech levels at 1 m per octave band 125 Hz-8 kHz: a user input, no default from
+    # the filed sources (QUESTIONS.md Q-STI3, D-31).
+    sti_speech_levels: tuple[float, ...] = param(
+        (),
+        item=float,
+        label="STI speech levels at 1 m",
+        unit="dB",
+        minimum=0.0,
+        maximum=140.0,
+        group="STI",
+        help="Custom: 7 octave-band levels 125 Hz-8 kHz in dB re 20 µPa",
+    )
+    # Calibrated measurements (D-31): impulse responses in Pa/FS with the inputs' offsets.
+    calibrated: bool = param(
+        False,
+        label="Calibrated impulse responses",
+        group="STI",
+        help="Measure in Pa/FS with the inputs' calibration (needed for STI)",
+    )
     sim_decay_time: float = param(
         1.0, label="Simulated T", unit="s", minimum=0.05, maximum=20.0, group="Simulation"
     )
@@ -130,6 +182,8 @@ class AppSettings(MeasurementSettings):
         super().__post_init__()
         if self.f_max < self.f_min:
             raise ValueError("f_max must not be below f_min")
+        if self.sti_speech_levels and len(self.sti_speech_levels) != 7:
+            raise ValueError("sti_speech_levels: give 7 octave-band levels (125 Hz-8 kHz) or none")
         for label in self.output_labels:
             if not OUTPUT_LABEL.fullmatch(label):
                 raise ValueError(f"output label {label!r}: use s1, s2, ...")

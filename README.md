@@ -5,11 +5,11 @@ reverberation times and room acoustic parameters per **ISO 3382-1/-2**, and the 
 absorption coefficient of a test specimen per **ISO 354** (reverberation room method).
 Desktop app (GTK 4 / libadwaita), command line and Python/Jupyter, all on one core.
 
-![Re:sonus Room: transfer function (magnitude and phase) of a measurement](docs/app.png)
+![Re:sonus Room: main window with a measurement](docs/app.png)
 
-> Status: pre-release (0.1.1). Calculation methods follow the cited standards and are
-> tested, but this is not a type-approved instrument; band-filter conformance to
-> IEC 61260-1 is not verified yet. See [Validation](#validation).
+> Status: pre-release (0.2.1); the STI estimate is provisional. Calculation methods
+> follow the cited standards and are tested, but this is not a type-approved instrument;
+> band-filter conformance to IEC 61260-1 is not verified yet. See [Validation](#validation).
 
 ## Features
 - **Measurement:** exponential sweep (also synchronized), noise, MLS; repetitions with
@@ -22,7 +22,13 @@ Desktop app (GTK 4 / libadwaita), command line and Python/Jupyter, all on one co
   ratio, flags; ISO 3382-2:2008 Annex B), C50, C80, D50, Ts, IACC (ISO 3382-1 Annex B);
   room average over positions (ISO 3382-2 clause 8) with the Table 1 position check.
 - **ISO 354:** equivalent absorption area and αs with uncertainty from the measured
-  decays, air absorption per ISO 9613-1.
+  decays, air absorption per ISO 9613-1; Absorption tab evaluating two folders of
+  measurements (empty room, with specimen), compliance findings shown, not blocking.
+- **Level calibration** of the inputs (calibrator or manual offset); impulse responses
+  in Pa/FS.
+- **STI estimate (provisional):** STI and MTI per octave from a calibrated impulse
+  response, a source calibration at 1 m and a background-noise recording; speech spectra
+  per vocal effort. Not yet to IEC 60268-16 (no masking or reception threshold).
 - **REW import and comparison:** RT60 exports read and compared band by band.
 - Results as HDF5 (documented in [docs/FILE_FORMAT.md](docs/FILE_FORMAT.md)), CSV, JSON
   and PNG/PDF/SVG plots.
@@ -37,7 +43,7 @@ built from source by pip, so it needs the GObject introspection headers. On Fedo
 Then, in a virtual environment:
 
     python -m venv .venv
-    .venv/bin/pip install "resonus-room @ git+https://github.com/resonus-cz/resonus-room@v0.1.1"
+    .venv/bin/pip install "resonus-room @ git+https://github.com/resonus-cz/resonus-room@v0.2.1"
 
 Exact versions of all dependencies, as tested: `pip install -r requirements.lock`.
 

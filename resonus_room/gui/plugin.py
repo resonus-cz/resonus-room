@@ -16,25 +16,44 @@ peak-to-noise ratio, flags; ISO 3382-2:2008 Annex B). Settings in the preference
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, PangoCairo
+from gi.repository import Adw, Gio, GLib, GObject, Gtk
 from numpy.typing import NDArray
+from resonus_core import data
 from resonus_core.audio import AudioIO, MeasurementAborted
+from resonus_core.calibration import (
+    CalibrationProposal,
+    CalibrationRecord,
+    CalibrationStore,
+    CalibrationStoreError,
+)
 from resonus_core.data import FrequencyResponse, ImpulseResponse, Metadata
 from resonus_core.devices import DeviceInfo, default_device, list_devices
 from resonus_core.gui.devices import DeviceGroups, device_groups
 from resonus_core.gui.host import Action, Host
+from resonus_core.gui.layout import (
+    APP_CSS,  # noqa: F401  (re-exported: the app's CSS, D-20...D-23, D-36)
+    header_brand,
+    install_css,
+    ribbon,
+    ribbon_button,
+    ribbon_grid,
+)
+from resonus_core.gui.overlays import band_table, fill_table
 from resonus_core.gui.preferences import settings_page
 from resonus_core.measure import measurement_warnings
 from resonus_core.plot import MplPlotView, navigable, set_trace_visible
-from resonus_core.style import TOKENS, font_files
 
 from resonus_room import __version__
+from resonus_room.cli_sti import calibrate_irs, devices_for
 from resonus_room.core.analysis import PARAMETERS, RoomAnalysis  # noqa: F401
+from resonus_room.core.binaural import BinauralParameters, iacc_band_set, pair_iacc
+from resonus_room.core.calibrate import capture_tone, input_profiles, store_path
 from resonus_room.core.engine import (
     analyze_ir,
     band_impulse_responses,
@@ -60,22 +79,45 @@ from resonus_room.core.levels import (
 )
 from resonus_room.core.positions import label_from_filename
 from resonus_room.core.room_average import average_entries
-from resonus_room.core.session import AVERAGE_COLOR, Entry, Session
+from resonus_room.core.session import AVERAGE_COLOR, Entry, Session, ear_pairs
 from resonus_room.core.settings import AppSettings, load_settings
+from resonus_room.core.sti_inputs import (
+    record_noise,
+    settings_speech_levels,
+    source_calibration,
+)
+from resonus_room.gui.absorption_tab import EXPORT_SUFFIXES as ABSORPTION_EXPORTS
+from resonus_room.gui.absorption_tab import AbsorptionTab
+from resonus_room.gui.calibration_page import CalibrationPage
 from resonus_room.gui.meter import LevelMeters
 from resonus_room.gui.results import ResultsList
+from resonus_room.gui.sti_tab import StiTab
 from resonus_room.plotting import (
+    CENTRE_TIME_PARAMETERS,
+    CLARITY_PARAMETERS,
+    DEFINITION_PARAMETERS,
+    EMPTY_CLARITY_LIMITS,
     EMPTY_FREQUENCY_LIMITS,
     EMPTY_LEVEL_LIMITS,
     EMPTY_MAGNITUDE_LIMITS,
     EMPTY_TIME_LIMITS,
+    EMPTY_TS_LIMITS,
+    IACC_PARAMETERS,
     PHASE_LIMITS,
+    RATIO_LIMITS,
+    RT_PARAMETERS,
     band_ticks,
+    empty_band_axes,
+    empty_iacc_axes,
     empty_limits,
     empty_rt_axes,
     hide_legend,
     keep_traces,
     peak_delay,
+    setup_centre_time_axes,
+    setup_clarity_axes,
+    setup_definition_axes,
+    setup_iacc_axes,
     setup_ir_axes,
     setup_phase_axes,
     setup_response_axes,
@@ -84,6 +126,7 @@ from resonus_room.plotting import (
     show_band_ir,
     show_decay,  # noqa: F401
     show_fit,  # noqa: F401
+    show_iacc_entry,
     show_ir,  # noqa: F401
     show_parameters,
     show_phase_entry,
@@ -123,24 +166,6 @@ LEVEL_TOOLTIP = (
     "Playback level of the excitation, dB re full scale (amplitude 1): peak for sweeps "
     "and MLS, RMS for noise (AES17 dBFS of noise = this value + 3.01 dB)"
 )
-# Ribbon, captions and the accent frame around the tab content (D-20, design choice).
-APP_CSS = """
-.resonus-ribbon { padding: 6px 12px 3px 12px; }
-.resonus-ribbon .ribbon-caption { font-size: smaller; opacity: 0.6; }
-/* Stop while measuring: solid red like the solid blue Measure (D-22) */
-.resonus-ribbon button.destructive-action {
-  background-color: var(--destructive-bg-color);
-  color: var(--destructive-fg-color);
-}
-/* brand in the header bar: Lexend SemiBold, the weight of the plot mark (D1, D-23);
-   5px: the text starts at the Measure button's left edge (header 6px + 1px side
-   bearing + 5px = ribbon padding 12px) */
-.resonus-brand { font-family: Lexend; font-weight: 600; font-size: 1.2em; margin-left: 5px; }
-.resonus-panel {
-  border: 1px solid color-mix(in srgb, var(--accent-bg-color) 45%, transparent);
-  border-radius: 8px;
-}
-"""
 # Header bar (user request 2026-11-05, D-23): brand left, app name without it centred.
 HEADER_TITLE = "Room"
 BAND_LABELS = ("Octave", "1/3 octave")
@@ -149,6 +174,10 @@ TABLE_COLUMNS = (
     "Band [Hz]", "EDT [s]", "T20 [s]", "T30 [s]", "r² T20", "ξ T20 [‰]", "ξ T30 [‰]",
     "C [%]", "PNR [dB]", "Flags",
 )  # fmt: skip
+# Clarity tab table (D-28); D50 a ratio (ISO 3382-1:2009 Eq. (A.11)).
+CLARITY_COLUMNS = ("Band [Hz]", "C50 [dB]", "C80 [dB]", "D50 [–]", "Ts [ms]")
+# Title of the IACC plot without an ear pair (D-28).
+NO_PAIR_TITLE = "Interaural cross-correlation: no ear pair (labels s#m#L and s#m#R)"
 
 
 def channel_label(ir: ImpulseResponse, fallback: str) -> str:
@@ -161,6 +190,11 @@ def channel_label(ir: ImpulseResponse, fallback: str) -> str:
     if isinstance(channel, dict) and isinstance(channel.get("label"), str):
         return channel["label"]
     return fallback
+
+
+def calibration_store_path() -> Path:
+    """Path of the calibration history (``core.calibrate.store_path()``, D-31)."""
+    return store_path()
 
 
 def settings_path() -> Path:
@@ -192,6 +226,37 @@ def table_rows(analysis: RoomAnalysis) -> list[list[str]]:
             ]
         )
     return rows
+
+
+# Inner tabs of the Clarity tab (D-33): page name, title, plot attribute.
+CLARITY_PAGES = (
+    ("clarity", "Clarity", "clarity_view"),
+    ("definition", "Definition", "definition_view"),
+    ("ts", "Centre time", "ts_view"),
+)
+
+
+def clarity_rows(analysis: RoomAnalysis) -> list[list[str]]:
+    """Rows of the Clarity table, one per band, columns as ``CLARITY_COLUMNS``."""
+    return [
+        [label, _num(p.c50, 2), _num(p.c80, 2), _num(p.d50, 3), _num(p.ts * 1000.0, 0)]
+        for label, p in zip(analysis.bands.labels, analysis.band_results, strict=True)
+    ]
+
+
+def pair_title(left: Entry, right: Entry) -> str:
+    """Legend text of an ear pair: the left entry's title without the trailing "L"."""
+    return left.title[:-1] if left.title.endswith("L") else f"{left.title} / {right.label}"
+
+
+def check_buttons(names: Sequence[str], on_toggle: Any) -> dict[str, Gtk.CheckButton]:
+    """One active check button per name; each toggle calls ``on_toggle()``."""
+    buttons: dict[str, Gtk.CheckButton] = {}
+    for name in names:
+        btn = Gtk.CheckButton(label=name.removeprefix("IACC "), active=True)
+        btn.connect("toggled", lambda _btn: on_toggle())
+        buttons[name] = btn
+    return buttons
 
 
 class Plugin:
@@ -227,9 +292,31 @@ class Plugin:
         setup_ir_axes(self.ir_view)
         self.rt_view = MplPlotView(brand_text=mark)
         setup_rt_axes(self.rt_view)
+        # Clarity tab (D-28, D-33): inner tabs Clarity (C50, C80), Definition (D50) and
+        # Centre time (Ts), one plot with its own toolbar each
+        self.clarity_view = MplPlotView(brand_text=mark)
+        setup_clarity_axes(self.clarity_view)
+        self.definition_view = MplPlotView(brand_text=mark)
+        setup_definition_axes(self.definition_view)
+        self.ts_view = MplPlotView(brand_text=mark)
+        setup_centre_time_axes(self.ts_view)
+        self.clarity_stack = Adw.ViewStack(vexpand=True)
+        # IACC tab (D-28), shown with settings.show_iacc
+        self.iacc_view = MplPlotView(brand_text=mark)
+        setup_iacc_axes(self.iacc_view)
+        self._iacc_page: Adw.ViewStackPage | None = None
+        # IACC per ear pair (left key, right key); cleared when the analysis changes
+        self._iacc_cache: dict[tuple[int, int], BinauralParameters | str] = {}
+        self._iacc_messages: list[str] = []
         self.stack = Adw.ViewStack()
         self._switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
-        self._measure = Gtk.Button(label="Measure")
+        # Measure / Stop: both labels in one stack, so the button keeps one width (user
+        # request 2026-11-06); the visible page is "measure" or "stop"
+        self._measure_labels = Gtk.Stack(hhomogeneous=True, vhomogeneous=True)
+        self._measure_labels.add_named(Gtk.Label(label="Measure"), "measure")
+        self._measure_labels.add_named(Gtk.Label(label="Stop"), "stop")
+        self._measure = Gtk.Button(child=self._measure_labels)
+        self._measure.add_css_class("text-button")  # padding of a label button
         self._measure.add_css_class("suggested-action")
         self._measure.set_tooltip_text("Run a measurement (Ctrl+M)")
         self._open = ribbon_button("document-open-symbolic", "Open")
@@ -274,23 +361,14 @@ class Plugin:
         )
         self._results.button.add_css_class("flat")
         self._band_select.set_tooltip_text("Band shown in the impulse-response tab")
-        self._table = Gtk.Grid(column_spacing=18, row_spacing=4, margin_start=12, margin_end=12)
-        self._table_frame = Gtk.Frame(
-            visible=False,
-            halign=Gtk.Align.END,
-            valign=Gtk.Align.START,
-            margin_top=12,
-            margin_end=12,
-        )
-        scroller = Gtk.ScrolledWindow(
-            min_content_height=160,
-            min_content_width=480,
-            max_content_height=400,
-            propagate_natural_height=True,
-        )
-        scroller.set_child(self._table)
-        self._table_frame.set_child(scroller)
+        self._table, self._table_frame = band_table()
         self._table_toggle = Gtk.ToggleButton(label="Table")
+        self._clarity_table, self._clarity_frame = band_table()
+        self._clarity_table_toggle = Gtk.ToggleButton(label="Table")
+        self._clarity_table_toggle.set_tooltip_text("Show the band table")
+        self._clarity_table_toggle.connect(
+            "toggled", lambda btn: self._clarity_frame.set_visible(btn.get_active())
+        )
         # room average of the shown entries in the RT tab (D-19)
         self._average_toggle = Gtk.ToggleButton(label="Room average")
         self._average_toggle.set_tooltip_text(
@@ -298,6 +376,23 @@ class Plugin:
             "s#m# labels, Table 1 check with the method set in Preferences"
         )
         self._average_toggle.connect("toggled", lambda _b: self._redraw())
+        # the same room average in the Clarity tab: a second button bound to the first
+        self._clarity_average_toggle = Gtk.ToggleButton(label="Room average")
+        self._clarity_average_toggle.set_tooltip_text(self._average_toggle.get_tooltip_text())
+        self._average_toggle.bind_property(
+            "active",
+            self._clarity_average_toggle,
+            "active",
+            GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
+        )
+        self._clarity_bands = Gtk.DropDown.new_from_strings(list(BAND_LABELS))
+        self._clarity_bands.set_tooltip_text("Band resolution")
+        self._bands.bind_property(
+            "selected",
+            self._clarity_bands,
+            "selected",
+            GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
+        )
         self._average_messages: list[str] = []
         self._band_irs: NDArray[np.float64] | None = None
         self._ir_toggles: dict[str, Gtk.CheckButton] = {}
@@ -316,14 +411,16 @@ class Plugin:
         self._table_toggle.connect(
             "toggled", lambda btn: self._table_frame.set_visible(btn.get_active())
         )
-        self._trace_toggles: dict[str, Gtk.CheckButton] = {}
-        for name in PARAMETERS:
-            btn = Gtk.CheckButton(label=name, active=True)
-            btn.connect(
-                "toggled",
-                lambda _btn: show_parameters(self.rt_view, self._visible_parameters()),
-            )
-            self._trace_toggles[name] = btn
+        self._trace_toggles = check_buttons(
+            RT_PARAMETERS, lambda: show_parameters(self.rt_view, self._visible_parameters())
+        )
+        self._iacc_toggles: dict[str, Gtk.CheckButton] = check_buttons(
+            IACC_PARAMETERS,
+            lambda: show_parameters(self.iacc_view, visible(self._iacc_toggles)),
+        )
+        self._iacc_toggles["IACC early"].set_tooltip_text("0-80 ms (ISO 3382-1:2009 B.4)")
+        self._iacc_toggles["IACC late"].set_tooltip_text("80 ms to the end")
+        self._iacc_toggles["IACC full"].set_tooltip_text("Onset to the end")
         self._export = ribbon_button("document-save-as-symbolic", "Export")
         self._export.set_sensitive(False)
         self._export.set_tooltip_text("Export (Ctrl+E): the file extension selects the format")
@@ -334,6 +431,31 @@ class Plugin:
         # device of the running measurement (Stop calls its abort(), D-22); None when idle
         self._measure_io: AudioIO | None = None
         self._brand: Gtk.Label | None = None  # header-bar brand (D-23)
+        # STI tab (D-31), shown with settings.show_sti; its inputs: files or GUI actions
+        self.sti_tab = StiTab(self._run_in_thread, self._toast, mark)
+        self.sti_tab.set_speech_levels(settings_speech_levels(self.settings))
+        self._sti_page: Adw.ViewStackPage | None = None
+        self._record_noise = Gtk.Button(label="Record noise…")
+        self._record_noise.set_tooltip_text(
+            "Record the background noise (no excitation) on every calibrated input"
+        )
+        self._use_source = Gtk.Button(label="Use as source calibration…")
+        self._use_source.set_tooltip_text(
+            "Save the active calibrated impulse response (free field, 1 m) as the source "
+            "calibration"
+        )
+        # Absorption tab (D-32), shown with settings.show_absorption
+        self.absorption_tab = AbsorptionTab(
+            self._run_in_thread, self._toast, lambda: self.settings, mark
+        )
+        self._absorption_page: Adw.ViewStackPage | None = None
+        # calibration history of the inputs (D-31)
+        try:
+            self._store = CalibrationStore.open(calibration_store_path())
+        except CalibrationStoreError as exc:
+            self._store = CalibrationStore.unsaved()
+            self._load_messages.append(f"calibrations not loaded ({exc}): none in use")
+        self._calibration_page: CalibrationPage | None = None
         self._empty_views()
 
     # AppPlugin protocol -------------------------------------------------------------
@@ -354,16 +476,12 @@ class Plugin:
         self._device.connect("clicked", lambda _b: self.show_device_preferences())
         self._test.connect("clicked", lambda _b: self.start_test())
         # header bar: brand, title and main menu only; the controls are in the ribbon (D-20)
-        install_fonts()
-        install_css()
-        brand = Gtk.Label(label=str(TOKENS["brand_text"]))
-        brand.add_css_class("resonus-brand")
-        brand.connect("notify::parent", lambda w, _p: _centre_title(w))
+        brand = header_brand(HEADER_TITLE)  # resonus_core.gui.layout (Q-C6)
         self._brand = brand
         return [brand]
 
     def main_view(self, host: Host) -> Gtk.Widget:
-        """Return the ribbon, the tab switcher and the three tabs (D-20).
+        """Return the ribbon, the tab switcher and the tabs (D-20; Clarity and IACC: D-28).
 
         Top to bottom: :meth:`_ribbon`; ``self._switcher`` (left-aligned); ``self.stack``
         in a box with the CSS class ``resonus-panel`` (``APP_CSS``, installed once).
@@ -417,6 +535,68 @@ class Plugin:
             "Reverberation time",
             "x-office-spreadsheet-symbolic",
         )
+        clarity_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        bar = Gtk.Box(spacing=6, margin_start=12, margin_end=12, margin_top=6)
+        for name, title, view in CLARITY_PAGES:
+            plot = navigable(getattr(self, view))
+            plot.set_vexpand(True)
+            self.clarity_stack.add_titled(plot, name, title)
+        ts_page = self.clarity_stack.get_page(self.clarity_stack.get_child_by_name("ts"))
+        ts_page.get_child().set_tooltip_text(
+            "Centre time (ISO 3382-1:2009 A.2.3, Eq. (A.13)), in ms"
+        )
+        switcher = Adw.InlineViewSwitcher(stack=self.clarity_stack)
+        bar.append(switcher)
+        bar.append(Gtk.Box(hexpand=True))
+        bar.append(self._clarity_average_toggle)
+        bar.append(self._clarity_bands)
+        bar.append(self._clarity_table_toggle)
+        overlay = Gtk.Overlay(vexpand=True)
+        overlay.set_child(self.clarity_stack)
+        overlay.add_overlay(self._clarity_frame)
+        clarity_box.append(bar)
+        clarity_box.append(overlay)
+        self.stack.add_titled_with_icon(
+            clarity_box, "clarity", "Clarity", "format-justify-fill-symbolic"
+        )
+        iacc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        bar = Gtk.Box(spacing=6, margin_start=12, margin_end=12, margin_top=6)
+        bar.append(Gtk.Label(label="IACC"))
+        for btn in self._iacc_toggles.values():
+            bar.append(btn)
+        iacc_box.append(bar)
+        iacc_view = navigable(self.iacc_view)
+        iacc_view.set_vexpand(True)
+        iacc_box.append(iacc_view)
+        self._iacc_page = self.stack.add_titled_with_icon(
+            iacc_box, "iacc", "IACC", "audio-headphones-symbolic"
+        )
+        self._iacc_page.set_visible(self.settings.show_iacc)
+        bar = self.sti_tab.widget.get_first_child()
+        assert isinstance(bar, Gtk.Box)
+        bar.insert_child_after(self._record_noise, self.sti_tab.noise_button)
+        bar.insert_child_after(self._use_source, self._record_noise)
+        self.sti_tab.source_button.connect(
+            "clicked", lambda _b: self._choose_h5("Source Calibration", self.sti_tab.load_source)
+        )
+        self.sti_tab.noise_button.connect(
+            "clicked", lambda _b: self._choose_h5("Noise Recording", self.sti_tab.load_noise)
+        )
+        self._record_noise.connect("clicked", lambda _b: self.start_noise_recording())
+        self._use_source.connect("clicked", lambda _b: self.save_source_dialog())
+        self._sti_page = self.stack.add_titled_with_icon(
+            self.sti_tab.widget, "sti", "STI", "audio-speakers-symbolic"
+        )
+        self._sti_page.set_visible(self.settings.show_sti)
+        for key, button in self.absorption_tab.folder_buttons.items():
+            button.connect("clicked", lambda _b, k=key: self._choose_absorption_folder(k))
+        self.absorption_tab.save_button.connect(
+            "clicked", lambda _b: self._absorption_export_dialog()
+        )
+        self._absorption_page = self.stack.add_titled_with_icon(
+            self.absorption_tab.widget, "absorption", "Absorption", "view-grid-symbolic"
+        )
+        self._absorption_page.set_visible(self.settings.show_absorption)
         self.stack.set_vexpand(True)
         tabs = Gtk.Box(margin_start=12, margin_end=12, margin_top=3, margin_bottom=6)
         self._switcher.set_halign(Gtk.Align.START)
@@ -481,16 +661,10 @@ class Plugin:
             "Files": files,
             "Results": results,
         }
-        ribbon = Gtk.Box(spacing=12)
-        ribbon.add_css_class("resonus-ribbon")
-        for k, title in enumerate(RIBBON_GROUPS):
-            if k:
-                ribbon.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-            ribbon.append(ribbon_group(title, content[title]))
-        return ribbon
+        return ribbon([(title, content[title]) for title in RIBBON_GROUPS])
 
     def preferences(self, host: Host) -> list[Adw.PreferencesPage]:
-        """Return the pages Measurement, Device and Analysis (D-17).
+        """Return the pages Measurement, Device, Analysis (D-17) and Calibration (D-31).
 
         All pages edit one settings object: every page gets ``current=lambda:
         self.settings`` and ``on_change=self._on_settings``, ``on_error=host.toast``.
@@ -504,6 +678,8 @@ class Plugin:
         3. ``settings_page(..., title="Analysis", icon_name="x-office-spreadsheet-symbolic",
            groups=ANALYSIS_GROUPS)``: re-analyses the shown IR at once
            (:meth:`_on_settings`).
+        4. :class:`CalibrationPage` (``self._calibration_page``): offsets of the inputs
+           (:meth:`calibrate_dialog`), STI speech levels, calibrated measurements.
         """
 
         def current() -> AppSettings:
@@ -539,7 +715,15 @@ class Plugin:
             on_error=host.toast,
             current=current,
         )
-        return [measurement, device_page, analysis]
+        self._calibration_page = CalibrationPage(
+            current,
+            self._on_settings,
+            self._store,
+            lambda: devices,
+            self.calibrate_dialog,
+            host.toast,
+        )
+        return [measurement, device_page, analysis, self._calibration_page.page]
 
     def _device_list(
         self, host: Host
@@ -654,13 +838,19 @@ class Plugin:
     def stop_measurement(self) -> None:
         """Stop the running measurement (D-22): ``abort()`` its device; no result is kept.
 
-        The button stays insensitive until the measurement thread has ended
+        ``abort()`` runs in its own thread, so the main loop never waits for the audio
+        backend. The button stays insensitive until the measurement thread has ended
         (``failed`` with ``MeasurementAborted``, toast "Measurement stopped").
         """
         if self._measure_io is None:
             return
-        self._measure_io.abort()
         self._measure.set_sensitive(False)
+        # abort() calls sounddevice.stop(), which can block while the measurement thread
+        # finishes or closes the same PortAudio stream (user report 2026-11-06: the GUI
+        # froze on Stop); never wait for it on the main loop
+        threading.Thread(
+            target=self._measure_io.abort, name="measurement-abort", daemon=True
+        ).start()
 
     def start_measurement(self) -> None:
         """Measure and analyse off the main loop, then show the results.
@@ -686,15 +876,18 @@ class Plugin:
 
         Channels = list[tuple[str, ImpulseResponse, FrequencyResponse | None]]
 
+        store = self._store
+
         def work() -> tuple[Channels, RoomAnalysis]:
             r = measure(settings, io)
+            irs = r.impulse_responses
+            if settings.calibrated:  # Pa/FS with the inputs' offsets (D-31)
+                irs = calibrate_irs(settings, irs, store, devices_for(settings))
             channels: Channels = [
                 (channel_label(ir, f"channel {k + 1}"), ir, fr)
-                for k, (ir, fr) in enumerate(
-                    zip(r.impulse_responses, r.frequency_responses, strict=True)
-                )
+                for k, (ir, fr) in enumerate(zip(irs, r.frequency_responses, strict=True))
             ]
-            return channels, analyze_ir(r.impulse_responses[0], settings)
+            return channels, analyze_ir(irs[0], settings)
 
         def done(result: tuple[Channels, RoomAnalysis]) -> None:
             self._measure_io = None
@@ -820,6 +1013,284 @@ class Plugin:
 
         dialog.open_multiple(host.window, None, on_done)
 
+    # STI inputs and calibration (D-31) ------------------------------------------------
+
+    def _run_in_thread(self, work: Any, done: Any, failed: Any) -> None:
+        """Run via the host's ``run_in_thread``; without a host (not shown yet) at once."""
+        if self._host is not None:
+            self._host.run_in_thread(work, done, failed)
+            return
+        try:
+            result = work()
+        except Exception as exc:
+            failed(exc)
+        else:
+            done(result)
+
+    def _toast(self, text: str) -> None:
+        """Show ``text`` as a toast (nothing without a host)."""
+        if self._host is not None:
+            self._host.toast(text)
+
+    def _choose_h5(self, title: str, load: Any) -> None:
+        """Ask for one ``.h5`` file and pass its path to ``load``."""
+        host = self._host
+        if host is None:
+            return
+        flt = Gtk.FileFilter(name="Re:sonus results (.h5)")
+        flt.add_pattern("*.h5")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(flt)
+        dialog = Gtk.FileDialog(title=title, filters=filters)
+
+        def on_done(d: Gtk.FileDialog, res: Gio.AsyncResult) -> None:
+            try:
+                f = d.open_finish(res)
+            except GLib.Error:
+                return  # cancelled
+            if f is not None and f.get_path():
+                load(Path(f.get_path()))
+
+        dialog.open(host.window, None, on_done)
+
+    def save_source(self, path: Path) -> bool:
+        """Save the active entry as the source calibration at ``path`` and load it.
+
+        The active impulse response must be calibrated (unit ``"Pa/FS"``); written with
+        ``data.save(path, source_calibration(ir))``, then ``sti_tab.load_source(path)``.
+        Errors are toasts; returns True on success.
+        """
+        if self.ir is None:
+            self._toast("No impulse response to use")
+            return False
+        try:
+            data.save(path, source_calibration(self.ir))
+        except (ValueError, OSError) as exc:
+            self._toast(f"Source calibration not saved: {exc}")
+            return False
+        return self.sti_tab.load_source(path)
+
+    def save_source_dialog(self) -> None:
+        """Ask where to save the source calibration (:meth:`save_source`)."""
+        host = self._host
+        if host is None or self.ir is None:
+            self._toast("Measure or open the free-field impulse response at 1 m first")
+            return
+        dialog = Gtk.FileDialog(
+            title="Save Source Calibration", initial_name="source_calibration.h5"
+        )
+
+        def on_done(d: Gtk.FileDialog, res: Gio.AsyncResult) -> None:
+            try:
+                f = d.save_finish(res)
+            except GLib.Error:
+                return
+            if f is not None and f.get_path():
+                self.save_source(Path(f.get_path()))
+
+        dialog.save(host.window, None, on_done)
+
+    def record_noise_to(self, folder: Path, duration: float | None = None) -> None:
+        """Record the background noise into ``folder`` off the main loop (D-31).
+
+        ``record_noise(settings, open_device(settings), offsets, duration)`` with the
+        inputs' active offsets; each input saved as ``folder / f"noise_{label}.h5"``; the
+        first one is loaded into the STI tab. Errors are toasts.
+        """
+        settings = self.settings
+        try:
+            profiles = input_profiles(settings, devices_for(settings))
+            offsets = [
+                None if (r := self._store.active(p)) is None else r.offset_db for p in profiles
+            ]
+            io = open_device(settings)
+        except Exception as exc:
+            self._toast(f"Noise recording failed: {exc}")
+            return
+        kwargs = {} if duration is None else {"duration": duration}
+        self._busy(True)
+
+        def work() -> list[Path]:
+            noises = record_noise(settings, io, offsets, **kwargs)
+            folder.mkdir(parents=True, exist_ok=True)
+            paths = []
+            for noise, label in zip(noises, settings.input_labels, strict=True):
+                path = folder / f"noise_{label}.h5"
+                data.save(path, noise)
+                paths.append(path)
+            return paths
+
+        def done(paths: list[Path]) -> None:
+            self._busy(False)
+            self._toast(f"Noise recorded: {', '.join(q.name for q in paths)}")
+            self.sti_tab.load_noise(paths[0])
+
+        def failed(exc: BaseException) -> None:
+            self._busy(False)
+            self._toast(f"Noise recording failed: {exc}")
+
+        self._run_in_thread(work, done, failed)
+
+    def start_noise_recording(self) -> None:
+        """Ask for a folder, then :meth:`record_noise_to`."""
+        host = self._host
+        if host is None:
+            return
+        dialog = Gtk.FileDialog(title="Folder for the Noise Recordings")
+
+        def on_done(d: Gtk.FileDialog, res: Gio.AsyncResult) -> None:
+            try:
+                f = d.select_folder_finish(res)
+            except GLib.Error:
+                return
+            if f is not None and f.get_path():
+                self.record_noise_to(Path(f.get_path()))
+
+        dialog.select_folder(host.window, None, on_done)
+
+    def save_calibration(self, index: int, proposal: CalibrationProposal) -> None:
+        """Append the confirmed proposal of input ``index`` to the history (D-31)."""
+        from datetime import UTC, datetime
+
+        profile = input_profiles(self.settings, devices_for(self.settings))[index]
+        record = CalibrationRecord.from_proposal(profile, proposal, datetime.now(UTC))
+        try:
+            self._store.append(record)
+        except CalibrationStoreError as exc:
+            self._toast(str(exc))
+        if self._calibration_page is not None:
+            self._calibration_page.refresh()
+        label = self.settings.input_labels[index]
+        self._toast(f"{label}: calibration saved ({proposal.offset_db:.2f} dB)")
+
+    def calibrate_dialog(self, index: int) -> None:
+        """Calibrate input ``index``: calibrator data, capture, then confirm (D-31).
+
+        An ``Adw.AlertDialog`` asks for the calibrator level and frequency (spin rows,
+        94 dB and 1000 Hz preset); "Measure" captures the tone off the main loop
+        (:func:`capture_tone`, nothing played); a second dialog shows the proposal and
+        "Save" stores it (:meth:`save_calibration`).
+        """
+        host = self._host
+        if host is None:
+            return
+        label = self.settings.input_labels[index]
+        level = Adw.SpinRow.new_with_range(60.0, 150.0, 0.1)
+        level.set_title("Calibrator level [dB]")
+        level.set_digits(1)
+        level.set_value(94.0)
+        frequency = Adw.SpinRow.new_with_range(31.5, 16000.0, 1.0)
+        frequency.set_title("Calibrator frequency [Hz]")
+        frequency.set_value(1000.0)
+        group = Adw.PreferencesGroup()
+        group.add(level)
+        group.add(frequency)
+        dialog = Adw.AlertDialog(
+            heading=f"Calibrate {label}",
+            body=(
+                f"Fit the calibrator on the microphone of {label} and switch it on; let it "
+                "stabilise. The tone is then recorded for 8 s (nothing is played)."
+            ),
+            extra_child=group,
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("measure", "Measure")
+        dialog.set_response_appearance("measure", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("measure")
+
+        def on_response(_d: Adw.AlertDialog, response: str) -> None:
+            if response != "measure":
+                return
+            settings = self.settings
+            try:
+                io = open_device(settings)
+            except Exception as exc:
+                host.toast(f"Calibration failed: {exc}")
+                return
+            lvl, freq = level.get_value(), frequency.get_value()
+            self._busy(True)
+
+            def done(proposal: CalibrationProposal) -> None:
+                self._busy(False)
+                self._confirm_calibration(index, proposal)
+
+            def failed(exc: BaseException) -> None:
+                self._busy(False)
+                host.toast(f"Calibration failed: {exc}")
+
+            host.run_in_thread(lambda: capture_tone(settings, io, index, freq, lvl), done, failed)
+
+        dialog.connect("response", on_response)
+        dialog.present(host.window)
+
+    def _confirm_calibration(self, index: int, proposal: CalibrationProposal) -> None:
+        """Show the proposal; "Save" stores it."""
+        host = self._host
+        if host is None:
+            return
+        label = self.settings.input_labels[index]
+        dialog = Adw.AlertDialog(
+            heading=f"{label}: offset {proposal.offset_db:.2f} dB",
+            body=(
+                f"Tone {proposal.frequency_hz:.1f} Hz at {proposal.measured_level_dbfs:.2f} dB "
+                f"re full scale; stability {proposal.stability_db:.3f} dB; tone to background "
+                f"{proposal.tone_to_background_db:.1f} dB. Save this calibration?"
+            ),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("save", "Save")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect(
+            "response",
+            lambda _d, r: self.save_calibration(index, proposal) if r == "save" else None,
+        )
+        dialog.present(host.window)
+
+    def _choose_absorption_folder(self, key: str) -> None:
+        """Ask for the folder of one ISO 354 condition (``"empty"``/``"specimen"``)."""
+        host = self._host
+        if host is None:
+            return
+        dialog = Gtk.FileDialog(title=f"Folder: {self.absorption_tab.folder_rows[key].get_title()}")
+
+        def on_done(d: Gtk.FileDialog, res: Gio.AsyncResult) -> None:
+            try:
+                f = d.select_folder_finish(res)
+            except GLib.Error:
+                return
+            if f is not None and f.get_path():
+                self.absorption_tab.set_folder(key, Path(f.get_path()))
+
+        dialog.select_folder(host.window, None, on_done)
+
+    def _absorption_export_dialog(self) -> None:
+        """Ask for the file of the Absorption tab's export; the extension selects it."""
+        host = self._host
+        if host is None:
+            return
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        allf = Gtk.FileFilter(name="All supported formats")
+        for s in ABSORPTION_EXPORTS:
+            allf.add_pattern(f"*{s}")
+        filters.append(allf)
+        for s, desc in ABSORPTION_EXPORTS.items():
+            flt = Gtk.FileFilter(name=f"{desc} (*{s})")
+            flt.add_pattern(f"*{s}")
+            filters.append(flt)
+        dialog = Gtk.FileDialog(
+            title="Export Absorption", filters=filters, initial_name="absorption.json"
+        )
+
+        def on_done(d: Gtk.FileDialog, res: Gio.AsyncResult) -> None:
+            try:
+                f = d.save_finish(res)
+            except GLib.Error:
+                return
+            if f is not None and f.get_path():
+                self.absorption_tab.export(Path(f.get_path()))
+
+        dialog.save(host.window, None, on_done)
+
     def export_to(self, path: Path) -> None:
         """Export the current results; the extension of ``path`` selects the format.
 
@@ -829,11 +1300,21 @@ class Plugin:
         (``export_channels``, D-17); the other formats export the active entry, its label
         named in the toast. Errors are shown as a toast.
         """
+        if self.stack.get_visible_child_name() == "absorption":
+            self.absorption_tab.export(path)  # its own result and formats (D-32)
+            return
         active = self.session.active_entry
         if self.analysis is None or self.ir is None or active is None:
             return
         group = [(e.label, e.ir) for e in self.session.group(active.name)]
-        views = {"tf": self.tf_view, "ir": self.ir_view, "rt": self.rt_view}
+        views = {
+            "tf": self.tf_view,
+            "ir": self.ir_view,
+            "rt": self.rt_view,
+            "clarity": self._clarity_visible_view(),
+            "iacc": self.iacc_view,
+            "sti": self.sti_tab.view,
+        }
         view = views.get(self.stack.get_visible_child_name() or "", self.rt_view)
         m = self.ir.metadata
         meta = Metadata(APP_NAME, __version__, description=m.description, device=m.device)
@@ -855,6 +1336,9 @@ class Plugin:
 
     def export_dialog(self) -> None:
         """Ask for the export file name; its extension selects the format."""
+        if self.stack.get_visible_child_name() == "absorption":
+            self._absorption_export_dialog()
+            return
         host = self._host
         if host is None or self.analysis is None or self.ir is None:
             return
@@ -921,20 +1405,21 @@ class Plugin:
            e.color, delay=peak_delay(e.ir))`` (phase re the IR peak, D-20); then
            ``keep_traces`` with those ids, ``update_legend(self.tf_view)``,
            ``hide_legend(self.phase_view)``.
-        5. RT: for each ``e`` in ``shown`` and ``name`` in ``PARAMETERS``:
-           ``show_rt_entry(self.rt_view, e.analysis, name, f"rt:{e.key}:{name}", e.title,
+        5. RT and Clarity (D-28): for each ``(view, prefix, names)`` of
+           :meth:`_parameter_views`, ``e`` in ``shown`` and ``name`` in ``names``:
+           ``show_rt_entry(view, e.analysis, name, f"{prefix}:{e.key}:{name}", e.title,
            e.color)``; plus the ids of :meth:`_average_traces` (room average, D-19);
-           ``keep_traces`` with those ids; ``show_parameters(self.rt_view,
-           self._visible_parameters())``.
-        6. ``self._show_active(shown[0])``.
+           ``keep_traces`` per view; the check buttons' visibility; band ticks.
+        6. IACC of the ear pairs (:meth:`_show_iacc`), then ``self._show_active(shown[0])``.
         """
         self._results.refresh(self.session)
         shown = self.session.shown()
         if not shown:
-            for view in (self.tf_view, self.phase_view, self.ir_view, self.rt_view):
+            for view in self._band_views() + (self.tf_view, self.phase_view, self.ir_view):
                 keep_traces(view, [])
             hide_legend(self.phase_view)
             self._fill_table([])
+            fill_table(self._clarity_table, CLARITY_COLUMNS, [])
             self._band_irs = None
             self._remove_windows()
             self.ir = self.fr = self.analysis = None
@@ -961,40 +1446,111 @@ class Plugin:
         update_legend(self.tf_view)
         hide_legend(self.phase_view)
 
-        rt_ids: list[str] = []
+        ids: dict[str, list[str]] = {"rt": [], "cl": [], "d": [], "ts": []}
         for e in shown:
             assert e.analysis is not None  # step 3
-            for name in PARAMETERS:
-                show_rt_entry(
-                    self.rt_view, e.analysis, name, f"rt:{e.key}:{name}", e.title, e.color
-                )
-                rt_ids.append(f"rt:{e.key}:{name}")
-        rt_ids += self._average_traces(shown)
-        keep_traces(self.rt_view, rt_ids)
+            for view, prefix, names in self._parameter_views():
+                for name in names:
+                    tid = f"{prefix}:{e.key}:{name}"
+                    show_rt_entry(view, e.analysis, name, tid, e.title, e.color)
+                    ids[prefix].append(tid)
+        for prefix, extra in self._average_traces(shown).items():
+            ids[prefix] += extra
+        for view, prefix, _names in self._parameter_views():
+            keep_traces(view, ids[prefix])
         show_parameters(self.rt_view, self._visible_parameters())
         active = shown[0].analysis
         assert active is not None  # step 3
         bands = active.bands
-        band_ticks(self.rt_view, bands.nominal, bands.fraction)
+        for view in (self.rt_view, self.clarity_view, self.definition_view, self.ts_view):
+            band_ticks(view, bands.nominal, bands.fraction)
+        self._show_iacc()
 
         self._show_active(shown[0])
 
-    def _average_traces(self, shown: list[Entry]) -> list[str]:
-        """Draw the room average of ``shown`` in the RT tab if the toggle is on (D-19).
+    def _band_views(self) -> tuple[MplPlotView, ...]:
+        """Return the views of the band tabs: RT, Clarity (three panels), IACC."""
+        return (self.rt_view, self.clarity_view, self.definition_view, self.ts_view, self.iacc_view)
 
-        Toggle ``self._average_toggle`` active: ``avg = average_entries(shown,
-        self.settings.position_method)``; for each ``name`` in ``PARAMETERS``:
-        ``show_average(self.rt_view, avg, name, f"rt:avg:{name}", AVERAGE_COLOR)``;
-        ``messages = list(avg.issues)``; return the three trace ids. On ``ValueError``
-        from ``average_entries``: ``messages = [f"Room average: {exc}"]``, return [].
-        Toggle off: ``messages = []``, return [].
+    def _parameter_views(self) -> list[tuple[MplPlotView, str, tuple[str, ...]]]:
+        """``(view, trace-id prefix, parameter names)`` of the RT and Clarity tabs (D-28)."""
+        return [
+            (self.rt_view, "rt", RT_PARAMETERS),
+            (self.clarity_view, "cl", CLARITY_PARAMETERS),
+            (self.definition_view, "d", DEFINITION_PARAMETERS),
+            (self.ts_view, "ts", CENTRE_TIME_PARAMETERS),
+        ]
+
+    def _clarity_visible_view(self) -> MplPlotView:
+        """Return the plot of the visible inner tab of the Clarity tab (export, D-33)."""
+        name = self.clarity_stack.get_visible_child_name() or "clarity"
+        return {n: getattr(self, v) for n, _t, v in CLARITY_PAGES}[name]
+
+    def _show_iacc(self) -> None:
+        """IACC of the ear pairs of the shown entries, if the IACC tab is on (D-28).
+
+        ``pairs = ear_pairs(self.session.shown(), self.session.entries)``; per pair
+        ``pair_iacc`` (cached by the two keys); each interval of ``IACC_PARAMETERS`` drawn
+        by ``show_iacc_entry`` in the left entry's colour, legend ``pair_title``. No
+        pair: the plot title says how to label ears. Errors of a pair are toasts, once
+        per change.
+        """
+        view = self.iacc_view
+        if not self.settings.show_iacc:
+            keep_traces(view, [])
+            self._iacc_messages = []
+            return
+        bands = iacc_band_set()
+        pairs = ear_pairs(self.session.shown(), self.session.entries)
+        ids: list[str] = []
+        messages: list[str] = []
+        for left, right in pairs:
+            key = (left.key, right.key)
+            if key not in self._iacc_cache:
+                try:
+                    self._iacc_cache[key] = pair_iacc(left.ir, right.ir, self.settings)
+                except ValueError as exc:
+                    self._iacc_cache[key] = str(exc)
+            params = self._iacc_cache[key]
+            title = pair_title(left, right)
+            if isinstance(params, str):
+                messages.append(f"IACC of {title}: {params}")
+                continue
+            for name in IACC_PARAMETERS:
+                tid = f"iacc:{left.key}:{name}"
+                show_iacc_entry(view, params, bands, name, tid, title, left.color)
+                ids.append(tid)
+        keep_traces(view, ids)
+        if ids:
+            view.axes.set_title("Interaural cross-correlation")
+            band_ticks(view, bands.nominal, bands.fraction)
+            show_parameters(view, visible(self._iacc_toggles))
+        else:
+            view.axes.set_title("Interaural cross-correlation" if messages else NO_PAIR_TITLE)
+            hide_legend(view)
+            empty_iacc_axes(view)
+        if messages != self._iacc_messages and self._host is not None:
+            for m in messages:
+                self._host.toast(m)
+        self._iacc_messages = messages
+
+    def _average_traces(self, shown: list[Entry]) -> dict[str, list[str]]:
+        """Draw the room average of ``shown`` in the RT and Clarity tabs (D-19, D-28).
+
+        Toggle ``self._average_toggle`` active (the Clarity tab's button is bound to
+        it): ``avg = average_entries(shown, self.settings.position_method)``; for each
+        ``(view, prefix, names)`` of :meth:`_parameter_views` and ``name`` in ``names``:
+        ``show_average(view, avg, name, f"{prefix}:avg:{name}", AVERAGE_COLOR)``;
+        ``messages = list(avg.issues)``; return the trace ids per prefix. On
+        ``ValueError`` from ``average_entries``: ``messages = [f"Room average: {exc}"]``,
+        return {}. Toggle off: ``messages = []``, return {}.
 
         The caller keeps only the returned ids (``keep_traces``). The messages are shown
         as toasts (``self._host.toast``, if the host is set) only when they differ from
         ``self._average_messages``; then ``self._average_messages = messages``. So a
         redraw (band switch, overlay change with the same findings) does not repeat them.
         """
-        ids: list[str] = []
+        ids: dict[str, list[str]] = {}
         messages: list[str] = []
         if self._average_toggle.get_active():
             try:
@@ -1002,9 +1558,12 @@ class Plugin:
             except ValueError as exc:
                 messages = [f"Room average: {exc}"]
             else:
-                for name in PARAMETERS:
-                    show_average(self.rt_view, avg, name, f"rt:avg:{name}", AVERAGE_COLOR)
-                    ids.append(f"rt:avg:{name}")
+                for view, prefix, names in self._parameter_views():
+                    ids[prefix] = []
+                    for name in names:
+                        tid = f"{prefix}:avg:{name}"
+                        show_average(view, avg, name, tid, AVERAGE_COLOR)
+                        ids[prefix].append(tid)
                 messages = list(avg.issues)
         if messages != self._average_messages and self._host is not None:
             for m in messages:
@@ -1014,6 +1573,7 @@ class Plugin:
 
     def _on_rename(self, key: int, label: str) -> None:
         """Results list: new channel label; a rejected label is reported as a toast."""
+        self._iacc_cache.clear()  # pairs follow the labels
         try:
             self.session.rename(key, label)
         except ValueError as exc:
@@ -1034,7 +1594,17 @@ class Plugin:
         empty_limits(self.phase_view, EMPTY_FREQUENCY_LIMITS, PHASE_LIMITS)
         self.ir_view.axes.set_title("Impulse response")
         empty_limits(self.ir_view, EMPTY_TIME_LIMITS, EMPTY_LEVEL_LIMITS)
-        empty_rt_axes(self.rt_view, settings_band_set(self.settings))
+        bands = settings_band_set(self.settings)
+        empty_rt_axes(self.rt_view, bands)
+        empty_band_axes(self.clarity_view, bands, EMPTY_CLARITY_LIMITS)
+        empty_band_axes(self.definition_view, bands, RATIO_LIMITS)
+        empty_band_axes(self.ts_view, bands, EMPTY_TS_LIMITS)
+        self.iacc_view.axes.set_title(
+            NO_PAIR_TITLE if self.settings.show_iacc else "Interaural cross-correlation"
+        )
+        empty_iacc_axes(self.iacc_view)
+        if hasattr(self, "sti_tab"):
+            self.sti_tab.show_entry(None, None)
 
     def _redraw(self) -> None:
         """Draw the session again if it has entries (room-average toggle)."""
@@ -1062,7 +1632,9 @@ class Plugin:
         self._band_select.set_selected(0)
         self._show_band()
         self._fill_table(table_rows(analysis))
+        fill_table(self._clarity_table, CLARITY_COLUMNS, clarity_rows(analysis))
         self._export.set_sensitive(True)
+        self.sti_tab.show_entry(entry.title, entry.ir)
 
     def _on_active(self, key: int) -> None:
         """Results list: make ``key`` active, then :meth:`show_session`."""
@@ -1077,6 +1649,7 @@ class Plugin:
     def _on_remove(self, key: int) -> None:
         """Results list: remove ``key``, then :meth:`show_session`."""
         self.session.remove(key)
+        self._iacc_cache = {k: v for k, v in self._iacc_cache.items() if key not in k}
         self.show_session()
 
     def _show_band(self) -> None:
@@ -1125,20 +1698,7 @@ class Plugin:
         self.ir_view.refresh()
 
     def _fill_table(self, rows: list[list[str]]) -> None:
-        child = self._table.get_first_child()
-        while child:
-            next_child = child.get_next_sibling()
-            self._table.remove(child)
-            child = next_child
-        for col, title in enumerate(TABLE_COLUMNS):
-            head = Gtk.Label(label=title, xalign=1.0 if col else 0.0)
-            head.add_css_class("heading")
-            self._table.attach(head, col, 0, 1, 1)
-        for r, row in enumerate(rows, start=1):
-            for col, text in enumerate(row):
-                cell = Gtk.Label(label=text, xalign=1.0 if 0 < col < len(row) - 1 else 0.0)
-                cell.add_css_class("numeric")
-                self._table.attach(cell, col, r, 1, 1)
+        fill_table(self._table, TABLE_COLUMNS, rows)
 
     # Settings -------------------------------------------------------------------------
 
@@ -1150,6 +1710,7 @@ class Plugin:
     def reanalyze(self) -> None:
         """Analyse the shown entries again with the current settings (synchronous)."""
         self.session.invalidate()
+        self._iacc_cache.clear()
         if self.session.entries:
             self.show_session()
 
@@ -1178,8 +1739,34 @@ class Plugin:
         if self._level.get_value() != settings.level:
             self._level.set_value(settings.level)
         if settings.plot_mark != old.plot_mark:
-            for view in (self.tf_view, self.ir_view, self.rt_view):
+            for view in (
+                self.tf_view,
+                self.ir_view,
+                self.rt_view,
+                self.clarity_view,
+                self.definition_view,
+                self.ts_view,
+            ):
                 view.set_brand(settings.plot_mark)
+            self.iacc_view.set_brand(settings.plot_mark)
+        if settings.plot_mark != old.plot_mark:
+            self.sti_tab.set_brand(settings.plot_mark)
+        if settings.plot_mark != old.plot_mark:
+            self.absorption_tab.set_brand(settings.plot_mark)
+        if settings.show_absorption != old.show_absorption and self._absorption_page:
+            self._absorption_page.set_visible(settings.show_absorption)
+        if settings.show_sti != old.show_sti and self._sti_page is not None:
+            self._sti_page.set_visible(settings.show_sti)
+        self.sti_tab.set_speech_levels(settings_speech_levels(settings))
+        if self._calibration_page is not None:
+            self._calibration_page.refresh()
+        if settings.show_iacc != old.show_iacc:
+            if self._iacc_page is not None:
+                self._iacc_page.set_visible(settings.show_iacc)
+            if self.session.entries:
+                self.show_session()
+            else:
+                self._empty_views()
         if meter_labels(settings) != self._meters.labels:
             self._meters.set_labels(meter_labels(settings))
         if any(getattr(old, f) != getattr(settings, f) for f in ANALYSIS_FIELDS):
@@ -1211,7 +1798,7 @@ class Plugin:
         becomes a red "Stop" (CSS ``destructive-action``, D-22).
         """
         self._measure.set_sensitive(not busy or measuring)
-        self._measure.set_label("Stop" if measuring else "Measure")
+        self._measure_labels.set_visible_child_name("stop" if measuring else "measure")
         self._measure.set_tooltip_text(
             "Stop the measurement (Ctrl+M)" if measuring else "Run a measurement (Ctrl+M)"
         )
@@ -1231,84 +1818,6 @@ class Plugin:
         self._test.set_sensitive(not busy)
 
 
-_css_installed = False
-
-
-_fonts_installed = False
-
-
-def install_fonts() -> None:
-    """Make the bundled Lexend fonts (resonus-core) available to GTK, once per process.
-
-    ``PangoCairo.FontMap.get_default().add_font_file(path)`` for each of
-    ``resonus_core.style.font_files()`` (Pango >= 1.56); without that call, or if a file
-    cannot be added, GTK falls back to the default font.
-    """
-    global _fonts_installed
-    if _fonts_installed:
-        return
-    font_map = PangoCairo.FontMap.get_default()
-    if hasattr(font_map, "add_font_file"):
-        for path in font_files():
-            try:
-                font_map.add_font_file(str(path))
-            except GLib.Error:
-                pass
-    _fonts_installed = True
-
-
-def _centre_title(widget: Gtk.Widget) -> None:
-    """Show ``HEADER_TITLE`` in the centre of the header bar that holds ``widget``.
-
-    The host's header bar shows the window title (``Plugin.title``) by default; the
-    window title stays "Resonus Room" for the window list and the About dialog.
-    """
-    header = widget.get_ancestor(Adw.HeaderBar)
-    if isinstance(header, Adw.HeaderBar):
-        header.set_title_widget(Adw.WindowTitle(title=HEADER_TITLE))
-
-
-def install_css() -> None:
-    """Load ``APP_CSS`` for the default display, once per process."""
-    global _css_installed
-    display = Gdk.Display.get_default()
-    if _css_installed or display is None:
-        return
-    provider = Gtk.CssProvider()
-    provider.load_from_string(APP_CSS)
-    Gtk.StyleContext.add_provider_for_display(
-        display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-    )
-    _css_installed = True
-
-
-def ribbon_button(icon_name: str, label: str) -> Gtk.Button:
-    """Flat ribbon button with icon and label (``Adw.ButtonContent``)."""
-    button = Gtk.Button(child=Adw.ButtonContent(icon_name=icon_name, label=label))
-    button.add_css_class("flat")
-    return button
-
-
-def labelled(text: str, widget: Gtk.Widget) -> Gtk.Widget:
-    """Return a box with a dimmed label before ``widget`` (ribbon spin buttons)."""
-    box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
-    label = Gtk.Label(label=text)
-    label.add_css_class("dim-label")
-    box.append(label)
-    box.append(widget)
-    return box
-
-
-def ribbon_grid() -> Gtk.Grid:
-    """Return the grid of one ribbon group (three rows of equal height)."""
-    return Gtk.Grid(row_spacing=3, column_spacing=6, row_homogeneous=True)
-
-
-def ribbon_group(title: str, content: Gtk.Widget) -> Gtk.Widget:
-    """Return one ribbon group: ``content`` with the caption ``title`` below."""
-    caption = Gtk.Label(label=title)
-    caption.add_css_class("ribbon-caption")
-    group = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-    group.append(content)
-    group.append(caption)
-    return group
+def visible(buttons: dict[str, Gtk.CheckButton]) -> list[str]:
+    """Names of the active check buttons."""
+    return [name for name, btn in buttons.items() if btn.get_active()]

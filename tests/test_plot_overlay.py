@@ -10,6 +10,7 @@ from resonus_room.core.analysis import analyze
 from resonus_room.core.simulate import exponential_decay_ir
 from resonus_room.plotting import (
     PARAMETER_LINESTYLES,
+    RT_PARAMETERS,
     keep_traces,
     rt_label,
     setup_response_axes,
@@ -40,7 +41,11 @@ def legend_texts(view):
 
 
 def test_linestyles_and_label():
-    assert PARAMETER_LINESTYLES == {"EDT": ":", "T20": "--", "T30": "-"}
+    assert PARAMETER_LINESTYLES == {
+        "EDT": ":", "T20": "--", "T30": "-", "Ts": "-",
+        "C50": "--", "C80": "-", "D50": "-",
+        "IACC early": "-", "IACC late": "--", "IACC full": ":",
+    }  # fmt: skip
     assert rt_label("T20", "Measurement 1 s1m1") == "T20, Measurement 1 s1m1"
 
 
@@ -58,7 +63,7 @@ def test_rt_entries_style_and_filter(analyses):
     setup_rt_axes(view)
     colors = ("#3584e4", "#e01b24")
     for k, (a, color) in enumerate(zip(analyses, colors, strict=True)):
-        for name in PARAMETER_LINESTYLES:
+        for name in RT_PARAMETERS:
             show_rt_entry(view, a, name, f"rt:{k}:{name}", f"m{k}", color)
     assert len(view.trace_ids()) == 6
     line = trace_line(view, "T30, m1")

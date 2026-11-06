@@ -9,19 +9,24 @@ here, so the rules are tested without a display; ``gui/plugin.py`` builds the wi
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from resonus_core.data import FrequencyResponse, ImpulseResponse
-from resonus_core.style import TRACE_COLORS
+from resonus_core.style import TOKENS, TRACE_COLORS
 
 from resonus_room.core.analysis import RoomAnalysis
 
-# Design choice (D-19): the first seven colours of the shared palette for the entries,
-# in order of creation; the eighth (Dark 3) is reserved for the room average.
-ENTRY_COLORS = TRACE_COLORS[:7]
-AVERAGE_COLOR = TRACE_COLORS[7]
+# Design choice (D-19): the seven trace colours of the shared palette for the entries,
+# in order of creation; the room average uses the neutral colour Dark 3 (resonus-core
+# 0.10.0 moved it out of the trace colours into the token `neutral_color`, core D-T1).
+ENTRY_COLORS = TRACE_COLORS
+AVERAGE_COLOR = str(TOKENS["neutral_color"])
 MEASUREMENT_NAME = "Measurement"
+# Dummy-head ear label s#m#L / s#m#R (user decisions D-17, Q-M10): group 1 the position,
+# group 2 the ear.
+EAR_LABEL = re.compile(r"(s[1-9][0-9]*m[1-9][0-9]*)([LR])")
 
 
 @dataclass
@@ -247,3 +252,56 @@ class Session:
         """Drop the cached analyses (``analysis = None`` on every entry)."""
         for e in self.entries:
             e.analysis = None
+
+
+def ear_partner(entry: Entry, entries: Sequence[Entry]) -> Entry | None:
+    """Return the other ear of ``entry`` (IACC tab, D-28), or None.
+
+    ``m = EAR_LABEL.fullmatch(entry.label)``; None if no match. ``other = m.group(1) +
+    ("R" if m.group(2) == "L" else "L")``. The partner is the first ``e`` of ``entries``
+    with ``e.key != entry.key`` and ``e.label == other`` and either ``e.name ==
+    entry.name`` (two channels of one measurement) or ``e.name ==
+    entry.name.replace(entry.label, other)`` (two opened files such as ``"s1m1L.wav"`` /
+    ``"s1m1R.wav"`` labelled ``"s1m1L"`` / ``"s1m1R"``). None if there is no such entry.
+    """
+    m = EAR_LABEL.fullmatch(entry.label)
+    if not m:
+        return None
+    base = m.group(1)
+    side = m.group(2)
+    other_side = "R" if side == "L" else "L"
+    other_label = base + other_side
+    for e in entries:
+        if e.key == entry.key:
+            continue
+        if e.label != other_label:
+            continue
+        if e.name == entry.name or e.name == entry.name.replace(entry.label, other_label):
+            return e
+    return None
+
+
+def ear_pairs(shown: Sequence[Entry], entries: Sequence[Entry]) -> list[tuple[Entry, Entry]]:
+    """Ear pairs ``(left, right)`` of the shown entries, in the order of ``shown``.
+
+    For each ``e`` in ``shown`` with ``p = ear_partner(e, entries)`` not None: the pair is
+    ``(e, p)`` if ``e``'s label ends with ``"L"``, else ``(p, e)``; a pair already in the
+    list (same two keys) is not added again. So the partner of a shown entry needs not be
+    shown itself.
+    """
+    pairs: list[tuple[Entry, Entry]] = []
+    seen: set[tuple[int, int]] = set()
+    for e in shown:
+        p = ear_partner(e, entries)
+        if p is None:
+            continue
+        key_pair = (e.key, p.key)
+        if key_pair in seen or (p.key, e.key) in seen:
+            continue
+        if e.label.endswith("L"):
+            pair = (e, p)
+        else:
+            pair = (p, e)
+        pairs.append(pair)
+        seen.add((pair[0].key, pair[1].key))
+    return pairs

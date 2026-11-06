@@ -120,11 +120,13 @@ def test_cli_average(tmp_path, capsys):
 
 @pytest.mark.skipif(not REAL.exists(), reason="REW sample data (refs/) not available")
 def test_real_box_precision(tmp_path):
-    # Box 2 of the REW set: 2 sources x 6 microphones = 12 combinations (precision).
+    # One box of the REW set (file names without a leading space; the user moves the two
+    # boxes between box1/ and box2/): 2 sources x 6 microphones = 12 combinations.
+    box = next(d for d in sorted(REAL.glob("box*")) if (d / "s1m 1.wav").exists())
     lines = ['method = "precision"']
     for s in (1, 2):
         for m in range(1, 7):
-            wav = REAL / f"s{s}m {m}.wav"
+            wav = box / f"s{s}m {m}.wav"
             lines += ["[[position]]", f'file = "{wav}"']
             lines += [f'source = "S{s}"', f'microphone = "M{m}"']
     (tmp_path / "p.toml").write_text("\n".join(lines) + "\n")

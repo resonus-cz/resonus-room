@@ -30,10 +30,12 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from resonus_core.bands import DEFAULT_FILTER_ORDER, BandSet, filter_bands
+from resonus_core.bands import DEFAULT_FILTER_ORDER, BandSet, band_set, filter_bands
+from resonus_core.data import ImpulseResponse
 from resonus_core.window import onset as find_onset
 
 from resonus_room.core.energy import PAD
+from resonus_room.core.settings import AppSettings
 
 # ISO 3382-1:2009 B.2, Eq. (B.2): lag range -1 ms < tau < +1 ms (strict).
 TAU_MAX = 1e-3
@@ -264,4 +266,52 @@ def binaural_parameters(
         late=late_vals,
         full=full_vals,
         onset=i0,
+    )
+
+
+def iacc_band_set() -> BandSet:
+    """Octave bands of the IACC: ``band_set(1, *IACC_BAND_RANGE)`` (125 Hz-4 kHz).
+
+    References
+    ----------
+    ISO 3382-1:2009, B.4 ("generally measured in octave bands ranging from 125 Hz to
+    4 000 Hz"); user decision 2026-11-05 (D-28): always these bands in the GUI.
+    """
+    return band_set(1, *IACC_BAND_RANGE)
+
+
+def pair_iacc(
+    left: ImpulseResponse, right: ImpulseResponse, settings: AppSettings
+) -> BinauralParameters:
+    """Early, late and full IACC of an ear pair in the bands of :func:`iacc_band_set`.
+
+    ``binaural_parameters(left.data, right.data, left.sample_rate, iacc_band_set(),
+    settings.filter_order, settings.reverse_filter)`` (common onset of the earlier ear).
+
+    Raises
+    ------
+    ValueError
+        ``f"sample rates differ: {left.sample_rate:g} Hz (left), {right.sample_rate:g} Hz
+        (right)"``; ``f"ear responses differ in length: {n_left} and {n_right} samples"``
+        (``len(left.data)``, ``len(right.data)``); from :func:`binaural_parameters`.
+
+    References
+    ----------
+    ISO 3382-1:2009, Annex B.
+    """
+    if left.sample_rate != right.sample_rate:
+        raise ValueError(
+            f"sample rates differ: {left.sample_rate:g} Hz (left), {right.sample_rate:g} Hz (right)"
+        )
+    n_left = len(left.data)
+    n_right = len(right.data)
+    if n_left != n_right:
+        raise ValueError(f"ear responses differ in length: {n_left} and {n_right} samples")
+    return binaural_parameters(
+        left.data,
+        right.data,
+        left.sample_rate,
+        iacc_band_set(),
+        settings.filter_order,
+        settings.reverse_filter,
     )

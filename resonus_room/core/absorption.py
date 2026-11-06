@@ -48,6 +48,15 @@ OBJECT_AREA_CHANGE = (1.0, 12.0)
 # ISO 354:2003 6.3.2: relative humidity 30...90 %, temperature at least 15 degC.
 HUMIDITY_RANGE = (30.0, 90.0)
 MIN_TEMPERATURE = 15.0
+# ISO 354:2003 8.1.2.1 NOTE, Eq. (6): c = 331 + 0.6 t (m/s, t in degC), given for
+# 15...30 degC. Outside that range the app extrapolates the same line and reports it
+# (user, 2026-11-06, D-35: findings never block the evaluation).
+SPEED_OF_SOUND_RANGE = (15.0, 30.0)
+# Names of the two conditions: prefix of the climate findings and of the folder notes.
+EMPTY_NAME = "empty room"
+SPECIMEN_NAME = "with specimen"
+SPEED_OF_SOUND_C0 = 331.0
+SPEED_OF_SOUND_SLOPE = 0.6
 # ISO 354:2003 7.1.4: at least 12 decay curves (6 with simultaneous sources), 3 microphone
 # positions and 2 source positions.
 MIN_DECAYS = 12
@@ -279,6 +288,43 @@ def check_climate(climate: Climate) -> list[str]:
     return issues
 
 
+def speed_of_sound_reported(temperature: float) -> tuple[float, list[str]]:
+    """Speed of sound by ISO 354:2003 Eq. (6), extrapolated outside 15...30 degC.
+
+    Parameters
+    ----------
+    temperature
+        Air temperature in degC.
+
+    Returns
+    -------
+    tuple[float, list[str]]
+        ``c = 331 + 0.6 t`` in m/s (``resonus_core.air.speed_of_sound`` inside the range)
+        and the findings: ``[]`` inside :data:`SPEED_OF_SOUND_RANGE`, else ``[f"8.1.2.1:
+        temperature {t:g} degC outside 15...30 degC of Eq. (6); c = {c:.1f} m/s
+        extrapolated"]``.
+
+    Raises
+    ------
+    ValueError
+        If ``c <= 0`` (no physical speed of sound).
+
+    References
+    ----------
+    ISO 354:2003, 8.1.2.1, NOTE, Eq. (6).
+    """
+    lo, hi = SPEED_OF_SOUND_RANGE
+    if lo <= temperature <= hi:
+        return float(speed_of_sound(temperature)), []
+    c = SPEED_OF_SOUND_C0 + SPEED_OF_SOUND_SLOPE * temperature
+    if c <= 0:
+        raise ValueError(f"Temperature {temperature:g} degC gives no positive speed of sound.")
+    return c, [
+        f"8.1.2.1: temperature {temperature:g} degC outside {lo:g}...{hi:g} degC of Eq. (6); "
+        f"c = {c:.1f} m/s extrapolated"
+    ]
+
+
 def check_positions(n_microphones: int, n_sources: int, simultaneous: bool = False) -> list[str]:
     """Check the number of positions against ISO 354:2003 7.1.4.
 
@@ -311,7 +357,8 @@ def absorption(
     """ISO 354 evaluation for the 18 one-third-octave bands of ``ISO354_FREQUENCIES``.
 
     1. ``fm = band_set(3, 100, 5000).center`` (exact mid-band frequencies, ISO 9613-1:1993
-       8.2.1); ``c_i = speed_of_sound(climate_i.temperature)``;
+       8.2.1); ``c_i, speed_issues_i = speed_of_sound_reported(climate_i.temperature)``
+       (extrapolated outside 15...30 degC, reported);
        ``m_i = power_attenuation_coefficient(fm, t_i, rh_i, p_i)`` (``m2`` from the
        conditions during the T2 measurement, D-9, confirmed by the user 2026-11-03).
     2. ``a1 = equivalent_absorption_area(t1, volume, c1, m1)``, ``a2`` likewise;
@@ -322,8 +369,9 @@ def absorption(
        ``area_std = sqrt(s_a1**2 + s_a2**2)``, ``alpha_std = area_std / specimen_area``
        (NaN without area); else NaN arrays.
     4. ``issues = check_empty_room(a1, volume) + check_climate(climate1) +
-       check_climate(climate2) + check_specimen(volume, specimen_area,
-       area if n_objects is not None else None)``.
+       climate findings + check_specimen(volume, specimen_area, area if n_objects is not None
+       else None)``; climate findings: ``check_climate(climate_i) + speed_issues_i``, each
+       prefixed ``"empty room: "`` (i = 1) or ``"with specimen: "`` (i = 2).
 
     Raises
     ------
@@ -344,8 +392,8 @@ def absorption(
     if n_objects is not None and n_objects < 1:
         raise ValueError("Number of objects must be at least 1.")
     fm = band_set(3, 100, 5000).center
-    c1 = float(speed_of_sound(climate1.temperature))
-    c2 = float(speed_of_sound(climate2.temperature))
+    c1, speed_issues1 = speed_of_sound_reported(climate1.temperature)
+    c2, speed_issues2 = speed_of_sound_reported(climate2.temperature)
     m1 = power_attenuation_coefficient(
         fm, climate1.temperature, climate1.relative_humidity, climate1.pressure
     )
@@ -370,8 +418,8 @@ def absorption(
         alpha_std = area_std / specimen_area if specimen_area is not None else nan
     issues = (
         check_empty_room(a1, volume)
-        + check_climate(climate1)
-        + check_climate(climate2)
+        + [f"{EMPTY_NAME}: {i}" for i in check_climate(climate1) + speed_issues1]
+        + [f"{SPECIMEN_NAME}: {i}" for i in check_climate(climate2) + speed_issues2]
         + check_specimen(volume, specimen_area, area if n_objects is not None else None)
     )
     return AbsorptionResult(
